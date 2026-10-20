@@ -11,7 +11,7 @@ Windows 11 desktop automation, in two parts:
 Both use the Win32 API directly (`SendInput`, window enumeration, low-level hooks). WinControlMCP reuses ClickBot's input code, and WinPilot reuses WinControlMCP's tools.
 
 ## Install (no Python needed)
-Build `WinPilot-Setup-<version>.exe` with `packaginguild.cmd` (below) and run it. It installs
+Build `WinPilot-Setup-<version>.exe` with `packaging\build.cmd` (below) and run it. It installs
 for your user only, so no admin rights are needed. It adds a Start Menu entry and, optionally, a desktop shortcut and
 start-with-Windows. The install folder also contains `WinControlMCP.exe`, the MCP server for other MCP clients:
 ```bat
