@@ -1,7 +1,6 @@
 """Screenshot-and-coordinates desktop control for vision models.
 
-Runs the actions of Claude's computer-use toolset (computer_toolset_20260801) and of two local
-computer-use models, Fara-7B and UI-TARS-1.5, on the real desktop. Each model sees the desktop
+Runs the actions of two local computer-use models, Fara-7B and UI-TARS-1.5, on the real desktop. Each model sees the desktop
 as a resized screenshot; a Screen maps the model's pixel coordinates back to the desktop.
 
 Every model's output is first turned into one plain action dict (see Computer.perform), so
@@ -27,12 +26,6 @@ import server
 cb = server.cb
 
 # ---------------------------------------------------------------- screen geometry
-
-
-def claude_fit(w, h):
-    """Largest size Claude 5.x models take without downscaling: 2576 px long edge, 4784 visual tokens."""
-    scale = min(1.0, 2576 / max(w, h), math.sqrt(4784 * 28 * 28 / (w * h)))
-    return round(w * scale), round(h * scale)
 
 
 def fara_fit(w, h):
@@ -130,38 +123,6 @@ def normalize_keys(keys):
 # ---------------------------------------------------------------- one action format for every model
 
 INPUT_KINDS = {"click", "drag", "mouse_down", "mouse_up", "scroll", "type", "key", "hold", "open_url"}
-CLAUDE_CLICKS = {"left_click": ("left", 1), "right_click": ("right", 1), "middle_click": ("middle", 1),
-                 "double_click": ("left", 2), "triple_click": ("left", 3)}
-
-
-def from_claude(name, a):
-    """A computer_toolset_20260801 member call -> action dict."""
-    if name in CLAUDE_CLICKS:
-        button, clicks = CLAUDE_CLICKS[name]
-        return {"kind": "click", "point": a.get("coordinate"), "button": button, "clicks": clicks, "mods": a.get("text")}
-    simple = {"screenshot": {"kind": "screenshot"}, "cursor_position": {"kind": "cursor"},
-              "left_mouse_down": {"kind": "mouse_down"}, "left_mouse_up": {"kind": "mouse_up"}}
-    if name in simple:
-        return dict(simple[name])
-    if name == "zoom":
-        return {"kind": "zoom", "region": a["region"]}
-    if name == "left_click_drag":
-        return {"kind": "drag", "start": a["start_coordinate"], "point": a["coordinate"], "mods": a.get("text")}
-    if name == "mouse_move":
-        return {"kind": "move", "point": a["coordinate"]}
-    if name == "scroll":
-        return {"kind": "scroll", "point": a.get("coordinate"), "direction": a.get("scroll_direction", "down"),
-                "amount": int(a.get("scroll_amount") or 3), "mods": a.get("text")}
-    if name == "type":
-        return {"kind": "type", "text": a["text"]}
-    if name == "key":
-        return {"kind": "key", "keys": a["text"], "repeat": int(a.get("repeat") or 1)}
-    if name == "hold_key":
-        return {"kind": "hold", "keys": a["text"], "duration": float(a.get("duration") or 1)}
-    if name == "wait":
-        return {"kind": "wait", "duration": float(a.get("duration") or 1)}
-    raise ValueError(f"Unknown computer action '{name}'.")
-
 # ---- Fara-7B (prompt from the Hugging Face model card, Qwen2.5-VL tool-call format)
 
 

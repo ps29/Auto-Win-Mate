@@ -12,13 +12,15 @@ ICON = str(Path(SPECPATH) / "winpilot.ico")
 # OmniParser's torch (about 1 GB) stays out of the package; detect_elements is simply not offered.
 EXCLUDES = ["torch", "torchvision", "numpy", "matplotlib", "scipy", "pandas", "IPython", "pytest"]
 HIDDEN = ["win32com.client", "win32clipboard", "comtypes.stream"] + collect_submodules("pywinauto")
+# uvicorn (the Claude Code bridge's HTTP server) picks its protocol and loop modules at runtime.
+PILOT_HIDDEN = ["pystray._win32"] + collect_submodules("uvicorn")
 DATAS = collect_data_files("sv_ttk")
 
-pilot = Analysis([str(ROOT / "WinPilot" / "pilot.py")], pathex=PATHS, hiddenimports=HIDDEN + ["pystray._win32"],
+pilot = Analysis([str(ROOT / "WinPilot" / "pilot.py")], pathex=PATHS, hiddenimports=HIDDEN + PILOT_HIDDEN,
                  datas=DATAS,
                  excludes=EXCLUDES)
 server = Analysis([str(ROOT / "WinControlMCP" / "server.py")], pathex=PATHS, hiddenimports=HIDDEN,
-                  excludes=EXCLUDES + ["anthropic", "pystray", "sv_ttk"])  # clickbot needs tkinter
+                  excludes=EXCLUDES + ["pystray", "sv_ttk"])  # clickbot needs tkinter
 
 pilot_exe = EXE(PYZ(pilot.pure), pilot.scripts, [], exclude_binaries=True, name="WinPilot", icon=ICON,
                 console=False, version=str(Path(SPECPATH) / "version_info.txt"))

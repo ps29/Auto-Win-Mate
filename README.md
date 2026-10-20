@@ -6,7 +6,7 @@ Windows 11 desktop automation, in two parts:
 |---|---|
 | [`ClickBot/`](ClickBot) | A desktop GUI auto-clicker. Record or build click/keyboard scripts, target a specific window, and replay them with hotkeys. |
 | [`WinControlMCP/`](WinControlMCP) | An [MCP](https://modelcontextprotocol.io) server that lets AI agents see and control the desktop: list windows, read an app's buttons and fields through UI Automation, click, type, scroll and take screenshots. It works with cloud models and with local models served by [Lemonade Server](https://lemonade-server.ai). |
-| [`WinPilot/`](WinPilot) | A tray app where you tell an AI (Claude API or a local Lemonade model) what to do in plain language. It carries the task out with the mouse and keyboard while you watch, asks before each action, and keeps an activity log of the desktop that the agent can read. Works with Claude (including its computer-use toolset) and local models, including the computer-use models Fara-7B and UI-TARS. |
+| [`WinPilot/`](WinPilot) | A tray app where you tell an AI (a local model via Lemonade, or Claude via the Claude Code CLI) what to do in plain language. It carries the task out with the mouse and keyboard while you watch, asks before each action, and keeps an activity log of the desktop that the agent can read. Local models include the computer-use models Fara-7B and UI-TARS. |
 
 Both use the Win32 API directly (`SendInput`, window enumeration, low-level hooks). WinControlMCP reuses ClickBot's input code, and WinPilot reuses WinControlMCP's tools.
 

@@ -1,7 +1,7 @@
 """WinPilot - tell an AI what to do on your Windows desktop.
 
-A tray app with a chat box. You type an instruction; an LLM (the Claude API, or a local
-model served by Lemonade) plans it and drives the desktop through the WinControl tools
+A tray app with a chat box. You type an instruction; an LLM (a local model served by Lemonade,
+or Claude through the Claude Code CLI) plans it and drives the desktop through the WinControl tools
 (..\\WinControlMCP\\server.py), which keep their failsafe, allowlist and action log.
 Input actions (clicks, typing, dragging, launching apps) wait for your approval unless you allow them.
 The Activity tab records what happens on the desktop (activity.py); the agent can read it.
@@ -41,6 +41,7 @@ else:
     sys.path.insert(0, os.environ.get("WINPILOT_SERVER_DIR", str(HERE.parent / "WinControlMCP")))
 import server  # noqa: E402  (imports ClickBot too, which makes this process DPI-aware)
 import activity  # noqa: E402
+import cli_bridge  # noqa: E402
 import computer  # noqa: E402
 import housekeeping  # noqa: E402
 import omniparser  # noqa: E402  (WinControlMCP\omniparser.py: optional vision element detection)
@@ -51,9 +52,7 @@ from PIL import Image, ImageDraw, ImageTk  # noqa: E402
 
 cb = server.cb
 user32 = cb.user32
-crypt32 = ctypes.WinDLL("crypt32")
 cb._sig(user32.SetWindowDisplayAffinity, wt.BOOL, wt.HWND, wt.DWORD)
-cb._sig(cb.kernel32.LocalFree, ctypes.c_void_p, ctypes.c_void_p)
 
 WDA_EXCLUDEFROMCAPTURE = 0x11
 SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOW, SW_RESTORE = 0, 4, 5, 9
@@ -63,53 +62,26 @@ MOD_ALT, MOD_CONTROL, MOD_NOREPEAT = 0x1, 0x2, 0x4000
 
 CONFIG = Path(os.environ.get("APPDATA", HERE)) / "WinPilot" / "settings.json"
 DEFAULTS = {
-    "backend": "claude",                      # "claude" or "lemonade"
-    "claude_model": "claude-opus-5-5",
-    "effort": "medium",
-    "api_key": "",                            # blank: ANTHROPIC_API_KEY or an `ant auth login` profile
-    "lemonade_url": "http://localhost:8000/api/v1",
+    "backend": "lemonade",                    # "lemonade" (local, the default) or "claude_cli" (Claude Code)
+    "lemonade_url": "http://localhost:13305/api/v1",
     "lemonade_model": "Qwen3-VL-8B-Instruct-GGUF",
+    "local_style": "tools",                   # "tools" (tool calling), "fara" (Fara-7B) or "uitars" (UI-TARS-1.5)
+    "claude_cli_path": "",                    # blank: find `claude` on PATH
+    "claude_cli_model": "",                   # blank: Claude Code's default; or opus, sonnet, haiku, a model id
+    "effort": "medium",
     "max_steps": 40,
     "ask_before_input": True,
     "hide_during_actions": True,
     "record_input": True,                     # log your own clicks and keys (never the text you type)
-    "computer_use": True,                     # give Claude its built-in screen/mouse/keyboard toolset
-    "local_style": "tools",                   # "tools" (tool calling), "fara" (Fara-7B) or "uitars" (UI-TARS-1.5)
     "takeover": True,                         # moving the mouse yourself stops the running task
     "keep_logs_days": 30,                     # delete daily activity logs older than this
     "input_speed": "human",                   # "human", "careful" or "instant"
 }
+PROVIDERS = {"lemonade": "Local LLM (Lemonade)", "claude_cli": "Claude Code CLI"}
 INPUT_SPEEDS = {"human": "Human-like", "careful": "Human-like, slower", "instant": "Instant (fastest)"}
 LOCAL_STYLES = {"tools": "Tool calling (Qwen3-VL and similar)", "fara": "Fara-7B (screenshots only)",
                 "uitars": "UI-TARS-1.5 (screenshots only)"}
-CLAUDE_MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
-FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
-TOOLSET_MODELS = {"claude-fable-5-1", "claude-mythos-5-1", "claude-fable-5", "claude-mythos-5", "claude-opus-5-5",
-                  "claude-opus-5", "claude-sonnet-5-5", "claude-sonnet-5", "claude-opus-4-8", "claude-haiku-5-5"}
-# The computer toolset covers these raw-input tools, so Claude gets one way to do each thing.
-REPLACED_BY_TOOLSET = {"click", "scroll", "screenshot", "wait", "move_mouse", "drag", "type_text", "press_keys"}
-
-
-class _Blob(ctypes.Structure):
-    _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
-
-
-for _fn in (crypt32.CryptProtectData, crypt32.CryptUnprotectData):
-    cb._sig(_fn, wt.BOOL, ctypes.POINTER(_Blob), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, wt.DWORD, ctypes.POINTER(_Blob))
-
-
-def _dpapi(data, protect):
-    """Encrypt/decrypt bytes for the current Windows user (so the API key isn't stored in plain text)."""
-    buf = ctypes.create_string_buffer(data, len(data))
-    blob_in, blob_out = _Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), _Blob()
-    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
-    if not fn(ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)):
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
-    finally:
-        cb.kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
+CLI_MODELS = ["", "opus", "sonnet", "haiku"]
 
 
 def load_settings():
@@ -117,19 +89,29 @@ def load_settings():
     try:
         saved = json.loads(CONFIG.read_text(encoding="utf-8"))
         cfg.update({k: v for k, v in saved.items() if k in DEFAULTS})
-        if saved.get("api_key_dpapi"):
-            cfg["api_key"] = _dpapi(base64.b64decode(saved["api_key_dpapi"]), False).decode()
     except (OSError, ValueError):
         pass
+    if cfg["backend"] not in PROVIDERS:  # e.g. "claude" from versions that used the Claude API
+        cfg["backend"] = "lemonade"
+    cfg["lemonade_url"] = lemonade_base(cfg["lemonade_url"])
     return cfg
 
 
+def lemonade_base(url):
+    """Accept any form of Lemonade's address: http://host:port, .../api/v1, or a full
+    .../chat/completions link copied from the Lemonade app. Returns the API base (.../api/v1)."""
+    url = (url or DEFAULTS["lemonade_url"]).strip().rstrip("/")
+    for tail in ("/chat/completions", "/completions", "/models"):
+        if url.endswith(tail):
+            url = url[: -len(tail)]
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    return url if url.endswith("/v1") else url + "/api/v1"
+
+
 def save_settings(cfg):
-    data = {k: v for k, v in cfg.items() if k != "api_key"}
-    if cfg["api_key"]:
-        data["api_key_dpapi"] = base64.b64encode(_dpapi(cfg["api_key"].encode(), True)).decode()
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    CONFIG.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
 # ---------------------------------------------------------------- LLM backends
 
@@ -157,71 +139,6 @@ INPUT_HELP_TOOLS = """- Use screenshot with click(x, y, window=...) only when an
 - You control the mouse (click, move_mouse to hover, drag, scroll) and the keyboard (type_text, \
 press_keys; arrows, home/end and ctrl+arrows move the text cursor). Call get_cursor to see where \
 the pointer, keyboard focus and text cursor are before typing."""
-INPUT_HELP_TOOLSET = """- For everything else use the computer toolset (screenshot, zoom, clicks, mouse_move, drag, \
-scroll, type, key). Its screenshots show the whole desktop; its coordinates are pixels of those \
-screenshots. Zoom in to read small text. End each group of actions with a screenshot so you can \
-verify the result before continuing. Arrows, home/end and ctrl+arrows move the text cursor; \
-get_cursor tells you where keyboard focus and the text cursor are."""
-
-
-class Refused(Exception):
-    pass
-
-
-class ClaudeBackend:
-    """Anthropic Messages API. History is append-only so thinking blocks stay valid."""
-
-    def __init__(self, cfg, tools):
-        import anthropic
-        self.client = anthropic.Anthropic(api_key=cfg["api_key"] or None, max_retries=3)
-        self.model, self.effort = cfg["claude_model"], cfg["effort"]
-        self.toolset = bool(cfg.get("computer_use")) and self.model in TOOLSET_MODELS
-        self.tools = [{"name": t.name, "description": t.description or "", "input_schema": t.input_schema}
-                      for t in tools if not (self.toolset and t.name in REPLACED_BY_TOOLSET)]
-        if self.toolset:
-            self.tools.append({"type": "computer_toolset_20260801"})
-            self.screen = computer.Screen(computer.claude_fit)
-        self.system = SYSTEM.format(input_help=INPUT_HELP_TOOLSET if self.toolset else INPUT_HELP_TOOLS)
-        self.messages = []
-
-    def mark(self):
-        return len(self.messages)
-
-    def rollback(self, mark):
-        del self.messages[mark:]
-
-    def add_user(self, text):
-        self.messages.append({"role": "user", "content": text})
-
-    def step(self):
-        extra = {}
-        if self.model in FALLBACK_MODELS:  # re-run a declined request on Anthropic's recommended model
-            extra = {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"}
-        r = self.client.beta.messages.create(
-            model=self.model, max_tokens=16000, system=self.system, tools=self.tools, messages=self.messages,
-            cache_control={"type": "ephemeral"}, output_config={"effort": self.effort}, **extra)
-        if r.stop_reason == "refusal":
-            why = getattr(r.stop_details, "explanation", None) if r.stop_details else None
-            raise Refused(why or "The model declined this request.")
-        content = [b.to_dict() for b in r.content]  # plain dicts keep every field, e.g. toolset_name
-        self.messages.append({"role": "assistant", "content": content})
-        text = "\n".join(b["text"] for b in content if b["type"] == "text").strip()
-        calls = [(b["id"], b["name"], b["input"], b.get("toolset_name")) for b in content if b["type"] == "tool_use"]
-        return text, calls, r.stop_reason == "pause_turn"
-
-    def add_results(self, results):
-        blocks = []
-        for res in results:
-            content = [{"type": "text", "text": res["text"] or "(no output)"}]
-            content += [{"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}}
-                        for mime, data in res["images"]]
-            block = {"type": "tool_result", "tool_use_id": res["id"], "content": content, "is_error": res["error"]}
-            if res.get("toolset"):
-                block["toolset_name"] = res["toolset"]  # required on every computer toolset result
-            blocks.append(block)
-        self.messages.append({"role": "user", "content": blocks})
-
-
 def _post_json(url, body=None, timeout=600):
     req = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None,
                                  headers={"Content-Type": "application/json"})
@@ -235,14 +152,14 @@ def _post_json(url, body=None, timeout=600):
 
 
 def lemonade_models(url):
-    return [m["id"] for m in _post_json(url.rstrip("/") + "/models", timeout=5).get("data", [])]
+    return [m["id"] for m in _post_json(lemonade_base(url) + "/models", timeout=5).get("data", [])]
 
 
 class LemonadeBackend:
     """OpenAI-compatible chat completions on a local Lemonade Server."""
 
     def __init__(self, cfg, tools):
-        self.url, self.model = cfg["lemonade_url"].rstrip("/"), cfg["lemonade_model"]
+        self.url, self.model = lemonade_base(cfg["lemonade_url"]), cfg["lemonade_model"]
         self.tools = [{"type": "function", "function": {"name": t.name, "description": t.description or "",
                                                         "parameters": t.input_schema}} for t in tools]
         self.messages = [{"role": "system", "content": SYSTEM.format(input_help=INPUT_HELP_TOOLS)}]
@@ -296,7 +213,7 @@ class VisionLocalBackend:
     KEEP_SCREENSHOTS = 3
 
     def __init__(self, cfg, tools, style):
-        self.url, self.model, self.style = cfg["lemonade_url"].rstrip("/"), cfg["lemonade_model"], style
+        self.url, self.model, self.style = lemonade_base(cfg["lemonade_url"]), cfg["lemonade_model"], style
         self.screen = computer.Screen(computer.fara_fit if style == "fara" else computer.uitars_fit)
         self.messages = [{"role": "system", "content": computer.FARA_SYSTEM}] if style == "fara" else []
         self.base = len(self.messages)
@@ -347,24 +264,7 @@ class VisionLocalBackend:
 
 
 def friendly_error(e):
-    """Turn API and network errors into something a user can act on."""
-    try:
-        import anthropic
-        if isinstance(e, anthropic.AuthenticationError) or (  # no key at all raises a plain TypeError
-                isinstance(e, (anthropic.AnthropicError, TypeError)) and "authentication" in str(e).lower()):
-            return "No valid Claude API key. Open Settings and add your key (or set ANTHROPIC_API_KEY)."
-        if isinstance(e, anthropic.PermissionDeniedError):
-            return "Your API key can't use this model. Pick another model in Settings."
-        if isinstance(e, anthropic.NotFoundError):
-            return "Model not found. Check the model name in Settings."
-        if isinstance(e, anthropic.RateLimitError):
-            return "The Claude API is rate-limiting you. Wait a minute and try again."
-        if isinstance(e, anthropic.APIConnectionError):
-            return "Can't reach the Claude API. Check your internet connection."
-        if isinstance(e, anthropic.APIStatusError):
-            return f"The Claude API returned an error ({e.status_code}): {e.message}"
-    except ImportError:
-        pass
+    """Turn errors into something a user can act on."""
     return str(e) if isinstance(e, RuntimeError) else f"{type(e).__name__}: {e}"
 
 # ---------------------------------------------------------------- agent
@@ -384,6 +284,15 @@ LOG_TOOL = types.SimpleNamespace(
                    "description": "'you' is the user, 'agent' is you, 'system' is window changes."}}})
 
 
+def _call_server(name, args):
+    """Run a WinControl tool. Callable from any thread (the agent's, or the Claude Code gateway's)."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(server.mcp.call_tool(name, args))
+    finally:
+        loop.close()
+
+
 class Agent(threading.Thread):
     """Runs one task at a time: model request -> approval -> tool call -> repeat."""
 
@@ -393,7 +302,6 @@ class Agent(threading.Thread):
         self.tasks = queue.Queue()
         self.stop_flag, self.decided = threading.Event(), threading.Event()
         self.decision = "deny"
-        self.loop = asyncio.new_event_loop()
         self.backend, self.backend_key = None, None
         self.elements = {}  # element id -> description, from the latest get_ui_elements
         self.allow_all = False
@@ -414,8 +322,9 @@ class Agent(threading.Thread):
         self.decided.set()
 
     def run(self):
-        self.tool_defs = [t for t in self.loop.run_until_complete(server.mcp.list_tools())
+        self.tool_defs = [t for t in asyncio.run(server.mcp.list_tools())
                           if t.name != "detect_elements" or omniparser.available()] + [LOG_TOOL]
+        self.gateway = None  # WinPilot's tools served to Claude Code, started on first use
         while True:
             text, cfg = self.tasks.get()
             self.stop_flag.clear()
@@ -433,19 +342,14 @@ class Agent(threading.Thread):
                     outcome = "task stopped by you"
                 self.log.add("agent", "task", outcome)
                 self.seen_id = self.log.last_id
-                try:
-                    self._suggest_new_chat()
-                except Exception:
-                    pass  # a hint is never worth killing the agent thread (the UI would wait forever)
                 self.emit("done")
 
     def _task(self, text, cfg):
         self.cfg = cfg
         style = cfg.get("local_style", "tools")
-        if cfg["backend"] == "claude":
-            key = ("claude", cfg["claude_model"], cfg["effort"], cfg["api_key"], cfg.get("computer_use"))
-            make = ClaudeBackend
-        elif style in ("fara", "uitars"):
+        if cfg["backend"] == "claude_cli":
+            return self._task_cli(text, cfg)
+        if style in ("fara", "uitars"):
             key = ("vision", cfg["lemonade_url"], cfg["lemonade_model"], style)
             make = lambda c, t: VisionLocalBackend(c, t, style)  # noqa: E731
         else:
@@ -462,10 +366,6 @@ class Agent(threading.Thread):
             self.emit("status", "Thinking...")
             try:
                 reply, calls, more = b.step()
-            except Refused as e:
-                b.rollback(mark)
-                self.emit("error", f"Refused: {e}")
-                return
             except Exception:
                 if step == 0:  # nothing happened yet: forget the message so the chat stays valid
                     b.rollback(mark)
@@ -479,19 +379,33 @@ class Agent(threading.Thread):
             b.add_results(self._run_calls(calls))
         self.emit("error", f"Stopped after {cfg['max_steps']} steps (the limit is in Settings).")
 
-    def _suggest_new_chat(self):
-        """Claude chats can't drop old screenshots (that would break the history), so long ones get slow
-        and costly. Suggest a fresh chat once per chat when they pile up."""
-        b = self.backend
-        if not isinstance(b, ClaudeBackend) or getattr(b, "suggested_new_chat", False):
-            return
-        shots = sum(1 for m in getattr(b, "messages", []) if isinstance(m["content"], list) for block in m["content"]
-                    if block.get("type") == "tool_result" and isinstance(block.get("content"), list)
-                    for part in block["content"] if part.get("type") == "image")
-        if shots >= 40:
-            b.suggested_new_chat = True
-            self.emit("info", f"This chat holds {shots} screenshots, which makes each reply slower and costlier. "
-                              "Click New chat when you start something unrelated.")
+    def _task_cli(self, text, cfg):
+        """Claude Code runs the whole loop itself; its tool calls come back through the gateway into
+        _cli_tool, on the gateway's threads, while this thread follows Claude's output."""
+        if self.gateway is None:
+            self.gateway = cli_bridge.Gateway([t.name for t in self.tool_defs], self._cli_tool)
+        key = ("claude_cli", cfg["claude_cli_path"], cfg["claude_cli_model"], cfg["effort"])
+        if not isinstance(self.backend, cli_bridge.ClaudeCli) or key != self.backend_key:
+            system = SYSTEM.format(input_help=INPUT_HELP_TOOLS)
+            self.backend = cli_bridge.ClaudeCli(cfg, self.gateway, system, CONFIG.parent / "claude-cli")
+            self.backend_key = key
+        self.cli_calls = 0
+        self.emit("status", "Claude is working...")
+        result = self.backend.run(self._with_recent_activity(text), lambda t: self.emit("assistant", t),
+                                  self.stop_flag)
+        if result is None:
+            self.emit("info", "Stopped.")
+
+    def _cli_tool(self, name, args):
+        """One tool call from Claude Code -> (text, images, error)."""
+        self.cli_calls += 1
+        if self.cli_calls > self.cfg["max_steps"]:
+            self.stop_flag.set()
+            self.emit("error", f"Stopped after {self.cfg['max_steps']} actions (the limit is in Settings).")
+            return "Stopped: the step limit was reached.", [], True
+        self.emit("status", "Claude is working...")
+        r = self._run_tool(f"cli{self.cli_calls}", name, args)
+        return r["text"], r["images"], r["error"]
 
     def _with_recent_activity(self, text):
         """Prefix the task with what happened since the model last looked (append-only, so history stays valid)."""
@@ -508,7 +422,7 @@ class Agent(threading.Thread):
         for call_id, name, args, toolset in (c if len(c) == 4 else (*c, None) for c in calls):
             if toolset and failed:
                 results.append({"id": call_id, "text": "Not executed: an earlier computer action in this turn failed.",
-                                "images": [], "error": True, "toolset": toolset if toolset == "computer" else None})
+                                "images": [], "error": True})
             elif toolset:
                 results.append(self._run_screen_action(call_id, name, args, toolset))
                 failed = results[-1]["error"]
@@ -535,19 +449,18 @@ class Agent(threading.Thread):
     def _run_screen_action(self, call_id, name, args, toolset):
         """A computer toolset member (Claude) or a parsed action (Fara-7B / UI-TARS)."""
         def result(text, images=(), error=False):
-            return {"id": call_id, "text": text, "images": list(images), "error": error,
-                    "toolset": toolset if toolset == "computer" else None}
+            return {"id": call_id, "text": text, "images": list(images), "error": error}
 
         if self.stop_flag.is_set():
             return result("Not run: the user stopped the task.", error=True)
         screen = self.backend.screen
         try:
-            act = args if toolset == "vision" else computer.from_claude(name, args or {})
+            act = args
             action = computer.describe(act, screen)
         except (KeyError, TypeError, ValueError) as e:
             self.emit("tool_error", f"{name}: {e}")
             return result(f"Invalid action: {e}", error=True)
-        self.emit("tool", f"{name if toolset == 'computer' else act['kind']}: {action}")
+        self.emit("tool", f"{act['kind']}: {action}")
         is_input = act["kind"] in computer.INPUT_KINDS
         if is_input and not self._approve(action):
             return result("The user denied this action. Don't retry it; adjust the plan or ask the user.", error=True)
@@ -606,7 +519,7 @@ class Agent(threading.Thread):
         try:
             if name in TARGET_FOCUS and args.get("window") is None:
                 self.app.restore_target_focus()
-            r = self.loop.run_until_complete(server.mcp.call_tool(name, args))
+            r = _call_server(name, args)
         except Exception as e:
             msg = str(e).removeprefix(f"Error executing tool {name}: ")
             self.emit("tool_error", msg)
@@ -1200,8 +1113,8 @@ class App:
 
     def _update_backend_label(self):
         c = self.cfg
-        model = c["claude_model"] if c["backend"] == "claude" else c["lemonade_model"]
-        self.backend_label.configure(text=f"{'Claude API' if c['backend'] == 'claude' else 'Lemonade'} · {model}")
+        model = (c["claude_cli_model"] or "default model") if c["backend"] == "claude_cli" else c["lemonade_model"]
+        self.backend_label.configure(text=f"{PROVIDERS[c['backend']]} · {model}")
 
     def apply_settings(self, cfg):
         self.cfg = cfg
@@ -1223,11 +1136,7 @@ def test_connection(cfg):
         if cfg["lemonade_model"] not in models:
             return f"Connected, but '{cfg['lemonade_model']}' isn't installed. Available: {', '.join(models[:6])}"
         return f"Connected to Lemonade. {cfg['lemonade_model']} is available."
-    import anthropic
-    client = anthropic.Anthropic(api_key=cfg["api_key"] or None, max_retries=1, timeout=60)
-    client.messages.create(model=cfg["claude_model"], max_tokens=16, output_config={"effort": "low"},
-                           messages=[{"role": "user", "content": "Reply with OK."}])
-    return f"Connected to the Claude API. {cfg['claude_model']} answered."
+    return cli_bridge.test_cli(cfg)
 
 
 class SettingsDialog(tk.Toplevel):
@@ -1245,7 +1154,7 @@ class SettingsDialog(tk.Toplevel):
         tabs = ttk.Notebook(outer)
         tabs.pack(fill="both", expand=True)
         self.vars = {k: (tk.BooleanVar if isinstance(v, bool) else tk.StringVar)(value=v) for k, v in c.items()}
-        self.backend = tk.StringVar(value="Claude API" if c["backend"] == "claude" else "Lemonade (local)")
+        self.backend = tk.StringVar(value=PROVIDERS[c["backend"]])
         f, row = None, 0
 
         def section(text):  # each section is a tab, so the dialog fits on small screens
@@ -1267,29 +1176,28 @@ class SettingsDialog(tk.Toplevel):
 
         section("Model")
         add("Provider", ttk.Combobox(f, textvariable=self.backend, state="readonly", width=40,
-                                     values=["Claude API", "Lemonade (local)"]))
-        add("Claude model", ttk.Combobox(f, textvariable=self.vars["claude_model"], values=CLAUDE_MODELS, width=40))
-        add("Effort", ttk.Combobox(f, textvariable=self.vars["effort"], state="readonly",
-                                   values=["low", "medium", "high"], width=40), "Higher is more careful but slower.")
-        add("API key", ttk.Entry(f, textvariable=self.vars["api_key"], show="•", width=42),
-            "Blank uses ANTHROPIC_API_KEY or an `ant auth login` profile. Stored encrypted for your Windows user.")
-        add("", ttk.Checkbutton(f, text="Let Claude see and click the screen directly (computer use)",
-                                variable=self.vars["computer_use"]),
-            "Claude's built-in screenshot, zoom, mouse and keyboard tools, used alongside the precise UI "
-            "element tools. Works with Claude 5 models.")
-
-        section("Local model")
+                                     values=list(PROVIDERS.values())),
+            "A local model keeps everything on this PC. Claude Code uses your Claude login (no API key).")
         add("Lemonade URL", ttk.Entry(f, textvariable=self.vars["lemonade_url"], width=42))
         lm = ttk.Frame(f)
         self.lemonade_box = ttk.Combobox(lm, textvariable=self.vars["lemonade_model"], width=29)
         self.lemonade_box.pack(side="left", fill="x", expand=True)
         ttk.Button(lm, text="Refresh", command=self._refresh_models).pack(side="left", padx=(6, 0))
-        add("Model", lm, "Use a vision model (e.g. Qwen3-VL) so screenshots work. Needs ctx_size >= 32768.")
+        add("Local model", lm, "Use a vision model (e.g. Qwen3-VL) so screenshots work. Needs ctx_size >= 32768.")
         self.style = tk.StringVar(value=LOCAL_STYLES.get(c.get("local_style", "tools"), LOCAL_STYLES["tools"]))
         add("Model type", ttk.Combobox(f, textvariable=self.style, state="readonly", width=40,
                                        values=list(LOCAL_STYLES.values())),
             "Fara-7B and UI-TARS-1.5 are trained to use a computer from screenshots alone; pick the type "
             "that matches the model above.")
+
+        section("Claude Code")
+        add("Claude model", ttk.Combobox(f, textvariable=self.vars["claude_cli_model"], values=CLI_MODELS, width=40),
+            "Blank uses Claude Code's default. Or opus, sonnet, haiku, or a full model id.")
+        add("Effort", ttk.Combobox(f, textvariable=self.vars["effort"], state="readonly",
+                                   values=["low", "medium", "high"], width=40), "Higher is more careful but slower.")
+        add("Claude Code path", ttk.Entry(f, textvariable=self.vars["claude_cli_path"], width=42),
+            "Blank finds `claude` on PATH. Log in once by running `claude` in a terminal. Claude Code only gets "
+            "WinPilot's desktop tools here (no file or shell access), and every action still needs your approval.")
 
         section("Safety and privacy")
         add("Max steps per task", ttk.Spinbox(f, from_=5, to=200, textvariable=self.vars["max_steps"], width=8))
@@ -1345,10 +1253,11 @@ class SettingsDialog(tk.Toplevel):
 
     def _collect(self):
         cfg = {k: v.get() for k, v in self.vars.items()}
-        cfg["backend"] = "claude" if self.backend.get() == "Claude API" else "lemonade"
+        cfg["backend"] = next(k for k, v in PROVIDERS.items() if v == self.backend.get())
         cfg["local_style"] = next(k for k, v in LOCAL_STYLES.items() if v == self.style.get())
         cfg["input_speed"] = next(k for k, v in INPUT_SPEEDS.items() if v == self.speed.get())
         cfg["max_steps"] = max(1, int(cfg["max_steps"]))
+        cfg["lemonade_url"] = lemonade_base(cfg["lemonade_url"])
         cfg["keep_logs_days"] = max(1, int(cfg["keep_logs_days"]))
         return {k: v.strip() if isinstance(v, str) else v for k, v in cfg.items()}
 

@@ -1,4 +1,4 @@
-"""Tests for computer.py: parsing Claude computer-toolset calls, Fara-7B and UI-TARS replies, and
+"""Tests for computer.py: parsing Fara-7B and UI-TARS replies, and
 running the resulting actions on the real desktop through a scaled Screen.
 
 The live part drives WinControlMCP's throwaway test window (tests/testwin.ps1);
@@ -28,17 +28,6 @@ TITLE = "WinControlTest"
 
 
 def test_parsers():
-    assert computer.from_claude("double_click", {"coordinate": [5, 6], "text": "shift"}) == {
-        "kind": "click", "point": [5, 6], "button": "left", "clicks": 2, "mods": "shift"}
-    assert computer.from_claude("scroll", {"scroll_direction": "left", "scroll_amount": 2})["direction"] == "left"
-    assert computer.from_claude("key", {"text": "ctrl+s", "repeat": 3}) == {"kind": "key", "keys": "ctrl+s", "repeat": 3}
-    assert computer.from_claude("zoom", {"region": [0, 0, 10, 10]})["kind"] == "zoom"
-    try:
-        computer.from_claude("teleport", {})
-        raise AssertionError("unknown member accepted")
-    except ValueError:
-        pass
-
     assert computer.normalize_keys("Return") == "enter"
     assert computer.normalize_keys(["Control", "a"]) == "ctrl+a"
     assert computer.normalize_keys("ctrl c") == "ctrl+c"
@@ -72,8 +61,7 @@ def test_parsers():
 
     h, w = computer.smart_resize(1080, 1920)
     assert (h, w) == (756, 1344) and h % 28 == 0 and w % 28 == 0 and h * w <= 1350 * 28 * 28, (h, w)
-    w, h = computer.claude_fit(2560, 1600)
-    assert max(w, h) <= 2576 and w * h <= 4784 * 28 * 28 + 2600, (w, h)
+    assert computer.fara_fit(2560, 1600) == (1428, 896)
     print("parsers ok")
 
 

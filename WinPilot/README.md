@@ -17,9 +17,9 @@ Closing the window keeps WinPilot running in the tray. Use the tray menu's **Qui
 
 ## Models
 On first launch, **Settings** opens so you can pick the provider and press **Test connection**. Settings also has **Start with Windows** and **Create desktop shortcut**.
-- **Claude API:** `claude-opus-5-5` by default (you can switch to Sonnet or Haiku). With **computer use** on (the default), Claude also gets its built-in screen toolset (`computer_toolset_20260801`): screenshots, zoom, clicks, drag, scroll, typing and keys, on top of the precise UI element tools. Leave the key blank to use `ANTHROPIC_API_KEY` or an `ant auth login` profile. A key typed into Settings is stored encrypted with Windows DPAPI in `%APPDATA%\WinPilot\settings.json`.
-- **Lemonade (local):** any model served by [Lemonade Server](https://lemonade-server.ai); **Refresh** lists the installed ones. Use a vision model such as `Qwen3-VL-8B-Instruct-GGUF` so screenshots work, and set `lemonade config set ctx_size=32768`. Small models handle short, specific tasks best.
-  - **Local model type** picks how WinPilot talks to the model: *Tool calling* (Qwen3-VL and similar), or one of two models trained to use a computer from screenshots alone: [Fara-7B](https://huggingface.co/microsoft/Fara-7B) (Microsoft; trained mostly on web tasks) and [UI-TARS-1.5](https://github.com/bytedance/UI-TARS) (ByteDance). Load their GGUF builds in Lemonade and choose the matching type.
+- **Local LLM (Lemonade)**, the default: any model served by [Lemonade Server](https://lemonade-server.ai); **Refresh** lists the installed ones. Use a vision model such as `Qwen3-VL-8B-Instruct-GGUF` so screenshots work, and set `lemonade config set ctx_size=32768`. Small models handle short, specific tasks best. Nothing leaves your PC.
+- **Claude Code CLI:** uses the `claude` CLI you are already logged in to, so no API key. WinPilot serves its desktop tools to Claude Code over a local, token-protected connection and runs `claude -p` with **only** those tools: no file, shell or web access, and no other MCP servers. Every action still goes through the approval bar, the activity log and the safety checks. Follow-up tasks continue the same Claude Code session. Pick a model (blank = Claude Code's default, or `opus`, `sonnet`, `haiku`) and an effort in Settings.
+- **Local model type** picks how WinPilot talks to a local model: *Tool calling* (Qwen3-VL and similar), or one of two models trained to use a computer from screenshots alone: [Fara-7B](https://huggingface.co/microsoft/Fara-7B) (Microsoft; trained mostly on web tasks) and [UI-TARS-1.5](https://github.com/bytedance/UI-TARS) (ByteDance). Load their GGUF builds in Lemonade and choose the matching type.
 
 The conversation carries over between tasks, so follow-ups like "now save it" work. **New chat** starts fresh.
 
@@ -50,7 +50,6 @@ All the WinControl safety controls still apply: `WINCONTROL_ALLOWED_EXES`, prote
 - Activity logs older than **Keep activity logs** days (Settings > More, default 30) are deleted at startup and once a
   day. **Clean up now** runs that immediately.
 - `WinControlMCP\actions.log` rotates at 5 MB (keeps `actions.log.1` to `.3`).
-- A Claude chat keeps every screenshot, so WinPilot suggests **New chat** once one holds 40 or more.
 - `..\maintenance.cmd` also clears Python and pip caches and checks the environment.
 
 ## Testing
@@ -66,6 +65,9 @@ mouse sweep counts as a takeover.
 ```bat
 ..\WinControlMCP\.venv\Scripts\python.exe tests\computer_test.py
 ..\WinControlMCP\.venv\Scripts\python.exe tests\housekeeping_test.py
+..\WinControlMCP\.venv\Scripts\python.exe tests\cli_bridge_test.py
 ```
-The computer test checks the parsers for Claude's toolset, Fara-7B and UI-TARS, and runs screen actions on the
+The Claude Code test uses a stand-in for `claude` (`tests/fake_claude.py`), so it needs no login and uses no Claude
+usage.
+The computer test checks the Fara-7B and UI-TARS parsers, and runs screen actions on the
 test window through a scaled screen.

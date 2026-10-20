@@ -102,7 +102,7 @@ def health():
     """Check the environment WinPilot and the server need. Returns (ok, lines)."""
     lines, ok = [], True
     for module, why in (("mcp", "MCP server"), ("pywinauto", "UI Automation"), ("mss", "screenshots"),
-                        ("PIL", "images"), ("anthropic", "Claude API"), ("pystray", "tray icon"),
+                        ("PIL", "images"), ("uvicorn", "Claude Code bridge"), ("pystray", "tray icon"),
                         ("sv_ttk", "theme (optional)"), ("torch", "OmniParser (optional)")):
         found = importlib.util.find_spec(module) is not None
         optional = "optional" in why
@@ -112,6 +112,8 @@ def health():
     ok &= r.returncode == 0
     lines.append("  pip check: " + (r.stdout or r.stderr).strip().splitlines()[0] if (r.stdout or r.stderr)
                  else "  pip check: ok")
+    claude = shutil.which("claude")
+    lines.append(f"  Claude Code CLI: {claude or 'not found (only needed for the Claude Code provider)'}")
     omni = SERVER_DIR / "omniparser"
     lines.append(f"  OmniParser weights: {human(size_of(omni)) if omni.exists() else 'not installed'}")
     lines.append(f"  Python environment: {human(size_of(SERVER_DIR / '.venv'))}")
