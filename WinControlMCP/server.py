@@ -31,7 +31,13 @@ from PIL import Image as PILImage  # noqa: E402
 from mcp.server.mcpserver import Image, MCPServer  # noqa: E402
 from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 
-LOG = HERE / "actions.log"
+FROZEN = getattr(sys, "frozen", False)  # packaged as WinControlMCP.exe / inside WinPilot.exe
+LOG = Path(os.environ.get("WINCONTROL_LOG", Path(os.environ.get("LOCALAPPDATA", HERE)) / "WinPilot" / "actions.log"
+                          if FROZEN else HERE / "actions.log"))
+LOG_MAX_BYTES, LOG_KEEP = 5 * 1024 * 1024, 3  # actions.log rotates to actions.log.1 .. .3
+# How fast simulated input is: "human" (default: curved mouse paths, typing at a person's pace),
+# "careful" (slower still) or "instant".
+cb.set_input_speed(os.environ.get("WINCONTROL_INPUT_SPEED", "human"))
 ALLOWED = {e.strip().lower() for e in os.environ.get("WINCONTROL_ALLOWED_EXES", "").split(",") if e.strip()}
 INTERACTIVE = {"Button", "Edit", "CheckBox", "ComboBox", "ListItem", "MenuItem", "TabItem",
                "Hyperlink", "RadioButton", "Document", "Slider", "TreeItem", "DataItem",
@@ -57,7 +63,11 @@ mcp = MCPServer(
         "focus_window or start_app -> get_ui_elements -> click_element / set_text -> "
         "get_ui_elements again to check the result. Element ids are only valid until the next "
         "get_ui_elements call. Use screenshot plus click(x, y, window=...) for apps that expose "
-        "no UI elements (games, custom-drawn apps). Call wait after actions that open windows. "
+        "no UI elements (games, custom-drawn apps). move_mouse hovers, drag does drag-and-drop, and "
+        "get_cursor shows where the pointer, keyboard focus and text cursor are. Use wait_for instead of "
+        "guessing waits, read_page_text to read pages and documents, and get_ui_elements(web_only=True) "
+        "inside browsers. "
+        "Call wait after actions that open windows. "
         "Apps may restore previous sessions (e.g. Notepad reopens unsaved tabs): check what a "
         "window contains before editing it, and never delete or overwrite the user's content "
         "or close unsaved work without asking."
@@ -80,6 +90,16 @@ def tool(fn):
 
 
 def _log(msg):
+    try:
+        if LOG.stat().st_size > LOG_MAX_BYTES:
+            for i in range(LOG_KEEP - 1, 0, -1):
+                older = LOG.with_name(f"{LOG.name}.{i}")
+                if older.exists():
+                    older.replace(LOG.with_name(f"{LOG.name}.{i + 1}"))
+            LOG.replace(LOG.with_name(f"{LOG.name}.1"))
+    except OSError:
+        pass  # no log yet, or another process is rotating it
+    LOG.parent.mkdir(parents=True, exist_ok=True)
     with open(LOG, "a", encoding="utf-8") as f:
         f.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
 
@@ -215,45 +235,190 @@ def start_app(command: str, arguments: str = "") -> str:
     return "Started, but no new window appeared within 8 s (it may have reused an existing one). Call list_windows."
 
 
-@tool
-def get_ui_elements(window: str | int, filter: str = "", max_depth: int = 12, max_items: int = 250) -> str:
-    """List a window's UI elements (buttons, fields, menu items...) with numeric ids.
-
-    Use the ids with click_element / set_text. `filter` keeps only lines containing that text.
-    Positions are screen coordinates. Ids are valid until the next get_ui_elements call.
-    """
+def _root(hwnd):
     from pywinauto.controls.uiawrapper import UIAWrapper
     from pywinauto.uia_element_info import UIAElementInfo
+    return UIAWrapper(UIAElementInfo(hwnd))
 
-    hwnd = _resolve(window)
-    _ELEMENTS.clear()
-    lines = [f"Window hwnd={hwnd}: {cb.window_title(hwnd)} [{cb.process_name(hwnd)}]"]
-    flt, truncated = filter.lower(), False
+
+def _walk(root, flt="", max_depth=12, max_items=250):
+    """Describable elements under root as (wrapper, depth, line); plus whether max_items cut it short."""
+    found, flt = [], flt.lower()
 
     def walk(el, depth):
-        nonlocal truncated
-        if depth > max_depth or truncated:
+        if depth > max_depth or len(found) >= max_items:
             return
         try:
             children = el.children()
         except Exception:
             return
         for child in children:
-            if len(_ELEMENTS) >= max_items:
-                truncated = True
+            if len(found) >= max_items:
                 return
             line = _describe(child)
             if line and (not flt or flt in line.lower()):
-                _ELEMENTS.append((child, hwnd))
-                lines.append(("" if flt else "  " * depth) + f"[{len(_ELEMENTS) - 1}] {line}")
+                found.append((child, depth, line))
             walk(child, depth + 1)
 
-    walk(UIAWrapper(UIAElementInfo(hwnd)), 0)
-    if not _ELEMENTS:
+    walk(root, 0)
+    return found, len(found) >= max_items
+
+
+def _web_document(hwnd):
+    """The page content of a Chrome/Edge/Electron window (its first Document element), or None."""
+    queue = [(_root(hwnd), 0)]
+    while queue:
+        el, depth = queue.pop(0)
+        if el.element_info.control_type == "Document" and depth:
+            return el
+        if depth < 8:
+            try:
+                queue += [(c, depth + 1) for c in el.children()]
+            except Exception:
+                pass
+    return None
+
+
+@tool
+def get_ui_elements(window: str | int, filter: str = "", max_depth: int = 12, max_items: int = 250,
+                    web_only: bool = False) -> str:
+    """List a window's UI elements (buttons, fields, menu items...) with numeric ids.
+
+    Use the ids with click_element / set_text. `filter` keeps only lines containing that text.
+    Positions are screen coordinates. Ids are valid until the next get_ui_elements call.
+    web_only=True lists only the web page inside a browser (Chrome, Edge, Electron apps),
+    skipping tabs and toolbars.
+    """
+    hwnd = _resolve(window)
+    root = _root(hwnd)
+    if web_only:
+        root = _web_document(hwnd)
+        if root is None:
+            raise ValueError("No web page found in that window. web_only works with Chrome, Edge and "
+                             "Electron apps; call get_ui_elements without it.")
+        max_depth = max(max_depth, 30)  # web pages nest deeply
+    found, truncated = _walk(root, filter, max_depth, max_items)
+    if len(found) < 10:
+        # Chromium and Electron apps build their accessibility tree only once someone asks.
+        time.sleep(0.6)
+        found, truncated = _walk(root, filter, max_depth, max_items)
+    _ELEMENTS[:] = [(el, hwnd) for el, _, _ in found]
+    lines = [f"Window hwnd={hwnd}: {cb.window_title(hwnd)} [{cb.process_name(hwnd)}]"]
+    lines += [("" if filter else "  " * depth) + f"[{i}] {line}" for i, (_, depth, line) in enumerate(found)]
+    if not found:
         lines.append("No UI elements found. This app may not expose UI Automation; use screenshot instead.")
     if truncated:
         lines.append(f"(stopped at {max_items} elements; use `filter` to narrow down)")
     return "\n".join(lines)
+
+
+@tool
+def read_page_text(window: str | int, max_chars: int = 8000) -> str:
+    """Read the text content of a window: a web page in a browser, a document in an editor, or
+    otherwise the text of its labels. Use it to read information instead of screenshots."""
+    hwnd = _resolve(window)
+    doc = _web_document(hwnd)
+    text = ""
+    for el in (doc, _root(hwnd)):
+        if el is None:
+            continue
+        try:
+            text = el.iface_text.DocumentRange.GetText(max(1, max_chars)) or ""
+        except Exception:
+            text = ""
+        if text.strip():
+            break
+    if not text.strip():  # no text pattern: collect the names of text-like elements
+        found, _ = _walk(doc or _root(hwnd), max_depth=30, max_items=1500)
+        names = [el.element_info.name.strip() for el, _, _ in found
+                 if el.element_info.control_type in ("Text", "Hyperlink", "Document", "Edit", "ListItem", "Button", "CheckBox",
+                                                  "RadioButton", "TabItem", "MenuItem", "DataItem", "Header")
+                 and (el.element_info.name or "").strip()]
+        text = "\n".join(dict.fromkeys(names))
+    text = text.replace("\r", "").replace("￼", " ")  # U+FFFC marks embedded objects (images...)
+    if not text.strip():
+        return "No readable text found. Try screenshot."
+    more = f"\n... ({len(text) - max_chars} more characters)" if len(text) > max_chars else ""
+    return f"Text of {cb.window_title(hwnd)}:\n{text[:max_chars]}{more}"
+
+
+@tool
+def wait_for(window: str | int, text: str = "", timeout_ms: int = 10000) -> str:
+    """Wait until a window exists (by title, part of a title, or exe), or, with `text`, until that
+    text appears in the window's UI (a button, label, field value...). Better than guessing with wait."""
+    deadline = time.time() + max(0, min(timeout_ms, 60000)) / 1000
+    last_error = ""
+    while True:
+        try:
+            hwnd = _resolve(window)
+            if not text:
+                return f"Window is there: hwnd={hwnd}: {cb.window_title(hwnd)}"
+            if text.lower() in cb.window_title(hwnd).lower():
+                return f"Found '{text}' in the title of hwnd={hwnd}: {cb.window_title(hwnd)}"
+            found, _ = _walk(_root(hwnd), text, max_depth=30, max_items=5)
+            if found:
+                return f"Found in hwnd={hwnd}: {found[0][2]}"
+            last_error = f"'{text}' not in {cb.window_title(hwnd)}"
+        except ValueError as e:
+            last_error = str(e)
+        if time.time() >= deadline:
+            raise TimeoutError(f"Timed out after {timeout_ms} ms: {last_error}")
+        time.sleep(0.5)
+
+
+@tool
+def clipboard(action: Literal["get", "set"], text: str = "") -> str:
+    """Read the clipboard's text (action='get') or put text on it (action='set'). Paste with
+    press_keys('ctrl+v'); setting the clipboard and pasting is the fastest way to enter long text."""
+    import win32clipboard
+    for attempt in range(10):  # another app may hold the clipboard open for a moment
+        try:
+            win32clipboard.OpenClipboard()
+            break
+        except Exception:
+            time.sleep(0.1)
+    else:
+        raise RuntimeError("The clipboard is in use by another program. Try again.")
+    try:
+        if action == "set":
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
+            _log(f"clipboard set {len(text)} chars")
+            return f"Put {len(text)} characters on the clipboard."
+        if not win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
+            return "The clipboard holds no text."
+        value = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+        _log("clipboard get")
+        return f"Clipboard text ({len(value)} characters):\n{value[:8000]}"
+    finally:
+        win32clipboard.CloseClipboard()
+
+
+cb.user32.MoveWindow.restype = wt.BOOL
+cb.user32.MoveWindow.argtypes = (wt.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.BOOL)
+cb.user32.GetWindowRect.restype = wt.BOOL
+cb.user32.GetWindowRect.argtypes = (wt.HWND, ctypes.POINTER(wt.RECT))
+
+
+@tool
+def arrange_window(window: str | int, action: Literal["maximize", "minimize", "restore", "move"],
+                   x: int | None = None, y: int | None = None,
+                   width: int | None = None, height: int | None = None) -> str:
+    """Maximize, minimize or restore a window, or move/resize it (action='move' with screen x, y and
+    optionally width, height in pixels)."""
+    hwnd = _resolve(window)
+    if action == "move":
+        if x is None or y is None:
+            raise ValueError("action='move' needs x and y.")
+        cb.user32.ShowWindow(hwnd, 9)  # restore first: a maximized window can't be moved
+        r = wt.RECT()
+        cb.user32.GetWindowRect(hwnd, ctypes.byref(r))
+        cb.user32.MoveWindow(hwnd, x, y, width or r.right - r.left, height or r.bottom - r.top, True)
+    else:
+        cb.user32.ShowWindow(hwnd, {"maximize": 3, "minimize": 6, "restore": 9}[action])
+    _log(f"arrange_window {hwnd} {action} {x} {y} {width} {height}")
+    return f"{action.title()}d '{cb.window_title(hwnd)}'." if action != "move" else \
+        f"Moved '{cb.window_title(hwnd)}' to ({x}, {y})."
 
 
 @tool
@@ -324,9 +489,81 @@ def click(x: int, y: int, button: Literal["left", "right", "middle"] = "left", c
     return f"Clicked {button} x{clicks} at screen ({sx}, {sy}).{note}"
 
 
+def _screen_point(x, y, window):
+    """Client (x, y) of `window`, or screen (x, y) without one -> guarded screen point and focus note."""
+    if window is not None:
+        hwnd = _resolve(window)
+        _guard(hwnd)
+        return cb.client_to_screen(hwnd, x, y), _focus(hwnd)
+    _guard(cb.root_of(cb.user32.WindowFromPoint(wt.POINT(x, y))))
+    return (x, y), ""
+
+
+@tool
+def move_mouse(x: int, y: int, window: str | int | None = None) -> str:
+    """Move the mouse pointer without clicking, e.g. to hover over a menu or show a tooltip.
+    Coordinates work as in click()."""
+    (sx, sy), note = _screen_point(x, y, window)
+    cb.move_to((sx, sy))
+    _log(f"move_mouse ({sx}, {sy})")
+    return f"Moved the mouse to screen ({sx}, {sy}).{note}"
+
+
+@tool
+def drag(from_x: int, from_y: int, to_x: int, to_y: int, window: str | int | None = None,
+         button: Literal["left", "right", "middle"] = "left") -> str:
+    """Press the mouse button at (from_x, from_y), move to (to_x, to_y) and release: drag-and-drop,
+    sliders, selecting text or resizing. Coordinates work as in click()."""
+    start, note = _screen_point(from_x, from_y, window)
+    end, _ = _screen_point(to_x, to_y, window)
+    cb.drag(start, end, button)
+    _log(f"drag {start} -> {end} {button}")
+    return f"Dragged {button} from screen {start} to {end}.{note}"
+
+
+class _GUITHREADINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("flags", wt.DWORD), ("hwndActive", wt.HWND), ("hwndFocus", wt.HWND),
+                ("hwndCapture", wt.HWND), ("hwndMenuOwner", wt.HWND), ("hwndMoveSize", wt.HWND),
+                ("hwndCaret", wt.HWND), ("rcCaret", wt.RECT)]
+
+
+cb.user32.GetGUIThreadInfo.restype = wt.BOOL
+cb.user32.GetGUIThreadInfo.argtypes = (wt.DWORD, ctypes.POINTER(_GUITHREADINFO))
+
+
+@tool
+def get_cursor() -> str:
+    """Where the mouse pointer is, which element has keyboard focus, and where the text cursor
+    (caret) is. Check this before type_text / press_keys to know where the keys will land."""
+    from pywinauto.controls.uiawrapper import UIAWrapper
+    from pywinauto.uia_defines import IUIA
+    from pywinauto.uia_element_info import UIAElementInfo
+
+    x, y = cb.cursor_pos()
+    under = cb.root_of(cb.user32.WindowFromPoint(wt.POINT(x, y)))
+    lines = [f"Mouse at ({x}, {y}) over hwnd={under}: {cb.window_title(under)} [{cb.process_name(under)}]"]
+    fg = cb.root_of(cb.user32.GetForegroundWindow())
+    lines.append(f"Foreground window: hwnd={fg}: {cb.window_title(fg)} [{cb.process_name(fg)}]")
+    try:
+        el = UIAWrapper(UIAElementInfo(IUIA().iuia.GetFocusedElement()))
+        info = el.element_info
+        lines.append("Keyboard focus: " + (_describe(el) or f"{info.control_type} \"{info.name or ''}\""))
+    except Exception:
+        lines.append("Keyboard focus: unknown")
+    gti = _GUITHREADINFO(cbSize=ctypes.sizeof(_GUITHREADINFO))
+    if cb.user32.GetGUIThreadInfo(0, ctypes.byref(gti)) and gti.hwndCaret:
+        r = gti.rcCaret
+        cx, cy = cb.client_to_screen(gti.hwndCaret, r.left, r.top)
+        lines.append(f"Text cursor (caret) at screen ({cx}, {cy}), height {r.bottom - r.top}")
+    else:
+        lines.append("Text cursor position unknown (this app doesn't report it); typing goes to the focused element.")
+    return "\n".join(lines)
+
+
 @tool
 def type_text(text: str, window: str | int | None = None) -> str:
-    """Type text into the focused control (or focus `window` first). Newlines press Enter."""
+    """Type text at the text cursor of the focused control (or focus `window` first). Newlines press
+    Enter. To place the text cursor, click into the field or move it with press_keys."""
     note = _focus(_resolve(window)) if window is not None else ""
     _guard()
     cb.type_text(text)
@@ -338,7 +575,9 @@ def type_text(text: str, window: str | int | None = None) -> str:
 def press_keys(keys: str, window: str | int | None = None) -> str:
     """Press keys or combos, space-separated and in order: e.g. 'ctrl+a delete', 'alt+f4', 'enter'.
     Names: a-z, 0-9, f1-f24, enter, tab, esc, space, backspace, delete, home, end, pageup,
-    pagedown, up, down, left, right, ctrl, shift, alt, win."""
+    pagedown, up, down, left, right, ctrl, shift, alt, win.
+    Moving the text cursor: left/right/up/down, home/end (line), ctrl+home/ctrl+end (document),
+    ctrl+left/ctrl+right (word); add shift to select, e.g. 'shift+end'."""
     combos = keys.split()
     for combo in combos:
         cb.parse_combo(combo)  # validate everything before pressing anything
@@ -376,10 +615,9 @@ def scroll(amount: int, x: int | None = None, y: int | None = None,
     return f"Scrolled {amount} notches.{note}"
 
 
-@tool
-def screenshot(window: str | int | None = None, max_width: int = 1280) -> list:
-    """Capture the whole desktop, or one window's client area (brought to the front first).
-    The reply explains how to turn image pixels into click() coordinates."""
+def _capture(window):
+    """Full-resolution image of a window's client area (brought to the front) or of the whole
+    desktop -> (image, left, top, hwnd or None, note)."""
     note = ""
     if window is not None:
         hwnd = _resolve(window)
@@ -396,12 +634,24 @@ def screenshot(window: str | int | None = None, max_width: int = 1280) -> list:
         raise ValueError("The window has no visible area (is it minimized?).")
     with mss.mss() as s:
         shot = s.grab({"left": left, "top": top, "width": w, "height": h})
-    img = PILImage.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-    scale = max(1.0, w / max(320, max_width))
+    return PILImage.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX"), left, top, hwnd, note
+
+
+def _shrink(img, max_width):
+    scale = max(1.0, img.width / max(320, max_width))
     if scale > 1:
-        img = img.resize((round(w / scale), round(h / scale)), PILImage.LANCZOS)
+        img = img.resize((round(img.width / scale), round(img.height / scale)), PILImage.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=85)
+    return img, scale, Image(data=buf.getvalue(), format="jpeg")
+
+
+@tool
+def screenshot(window: str | int | None = None, max_width: int = 1280) -> list:
+    """Capture the whole desktop, or one window's client area (brought to the front first).
+    The reply explains how to turn image pixels into click() coordinates."""
+    img, left, top, hwnd, note = _capture(window)
+    img, scale, image = _shrink(img, max_width)
     if hwnd:
         how = (f"To click pixel (px, py) of this image: click(x=round(px*{scale:.4f}), "
                f"y=round(py*{scale:.4f}), window={hwnd}).")
@@ -409,7 +659,36 @@ def screenshot(window: str | int | None = None, max_width: int = 1280) -> list:
         how = (f"To click pixel (px, py) of this image: click(x={left}+round(px*{scale:.4f}), "
                f"y={top}+round(py*{scale:.4f})).")
     _log(f"screenshot {'hwnd=' + str(hwnd) if hwnd else 'desktop'}")
-    return [f"Screenshot {img.width}x{img.height}. {how}{note}", Image(data=buf.getvalue(), format="jpeg")]
+    return [f"Screenshot {img.width}x{img.height}. {how}{note}", image]
+
+
+def detect_elements(window: str | int | None = None, max_width: int = 1280, max_items: int = 120) -> list:
+    """Find clickable things on screen by vision (OmniParser), for apps with no UI elements:
+    games, custom-drawn apps, remote desktops. Returns a screenshot with numbered boxes and the
+    click() point of each box. Needs setup_omniparser.cmd to have been run once."""
+    from PIL import ImageDraw
+    import omniparser
+
+    img, left, top, hwnd, note = _capture(window)
+    boxes = sorted(omniparser.detect(img)[:max_items], key=lambda b: (round(b[1] / 20), b[0]))  # reading order
+    marked = img.copy()
+    draw = ImageDraw.Draw(marked)
+    lines = []
+    for i, (x0, y0, x1, y1, score) in enumerate(boxes):
+        draw.rectangle((x0, y0, x1, y1), outline=(255, 0, 80), width=2)
+        draw.rectangle((x0, y0, x0 + 9 * len(str(i)) + 6, y0 + 16), fill=(255, 0, 80))
+        draw.text((x0 + 3, y0 + 2), str(i), fill="white")
+        cx, cy = round((x0 + x1) / 2), round((y0 + y1) / 2)
+        where = f"click(x={cx}, y={cy}, window={hwnd})" if hwnd else f"click(x={left + cx}, y={top + cy})"
+        lines.append(f"[{i}] {round(x1 - x0)}x{round(y1 - y0)} -> {where}")
+    _, _, image = _shrink(marked, max_width)
+    _log(f"detect_elements {'hwnd=' + str(hwnd) if hwnd else 'desktop'}: {len(boxes)} boxes")
+    head = f"Found {len(boxes)} clickable regions (numbered in the image). Click one with:{note}"
+    return ["\n".join([head] + lines) if boxes else "No clickable regions found." + note, image]
+
+
+if not FROZEN:  # the packaged exe leaves out torch (about 1 GB), so it has no vision detector
+    detect_elements = tool(detect_elements)
 
 
 @tool

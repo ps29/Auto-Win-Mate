@@ -14,6 +14,7 @@ as Administrator (Windows blocks input from lower-privilege processes).
 import ctypes
 import ctypes.wintypes as wt
 import json
+import math
 import queue
 import random
 import threading
@@ -92,6 +93,7 @@ _sig(user32.WindowFromPoint, wt.HWND, wt.POINT)
 _sig(user32.GetAncestor, wt.HWND, wt.HWND, wt.UINT)
 _sig(user32.GetWindowThreadProcessId, wt.DWORD, wt.HWND, ctypes.POINTER(wt.DWORD))
 _sig(user32.MapVirtualKeyW, wt.UINT, wt.UINT, wt.UINT)
+_sig(user32.VkKeyScanW, ctypes.c_short, wt.WCHAR)
 _sig(user32.SetWindowsHookExW, wt.HANDLE, ctypes.c_int, HOOKPROC, wt.HINSTANCE, wt.DWORD)
 _sig(user32.CallNextHookEx, LRESULT, wt.HANDLE, ctypes.c_int, wt.WPARAM, wt.LPARAM)
 _sig(user32.UnhookWindowsHookEx, wt.BOOL, wt.HANDLE)
@@ -191,7 +193,18 @@ class InputBlocked(RuntimeError):
     pass
 
 
+LAST_INJECTED = 0.0  # time.monotonic() of our latest synthetic input, so watchers can tell it from the user's
+
+
+def _set_cursor(x, y):
+    global LAST_INJECTED
+    LAST_INJECTED = time.monotonic()
+    user32.SetCursorPos(x, y)
+
+
 def _send(*inputs):
+    global LAST_INJECTED
+    LAST_INJECTED = time.monotonic()
     arr = (INPUT * len(inputs))(*inputs)
     ctypes.set_last_error(0)
     sent = user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
@@ -213,23 +226,153 @@ def _mouse(flags, data=0):
 BUTTON_FLAGS = {"left": (0x02, 0x04), "right": (0x08, 0x10), "middle": (0x20, 0x40)}
 
 
+# ---- input speed: instant (ClickBot's default) or human-like
+
+# Human-like timing, scaled by "pace" (1 = an average person, higher = slower and more careful).
+SPEEDS = {"instant": None, "human": {"pace": 1.0, "cps": (7.0, 12.0)}, "careful": {"pace": 1.7, "cps": (4.0, 7.0)}}
+_speed = None
+
+
+def set_input_speed(name):
+    """'instant' (no delays, ClickBot's default), 'human' or 'careful'."""
+    global _speed
+    if name not in SPEEDS:
+        raise ValueError(f"unknown input speed '{name}' (choose {', '.join(SPEEDS)})")
+    _speed = SPEEDS[name]
+
+
+def input_speed():
+    return next(name for name, value in SPEEDS.items() if value is _speed)
+
+
+class MovedByUser(RuntimeError):
+    pass
+
+
+def _pause(low, high):
+    """Sleep a random human-ish while (seconds, scaled by pace); nothing in instant mode."""
+    if _speed:
+        time.sleep(random.uniform(low, high) * _speed["pace"])
+
+
+def human_path(start, end, rng=random):
+    """Points from start to end along a slightly curved, eased path, like a hand moving a mouse:
+    a Bezier curve bowing to one side, with minimum-jerk easing (slow start, fast middle, slow end)."""
+    (x0, y0), (x1, y1) = start, end
+    dx, dy = x1 - x0, y1 - y0
+    dist = math.hypot(dx, dy)
+    if dist < 2:
+        return [tuple(end)]
+    bow = rng.uniform(-0.18, 0.18) * dist  # how far the curve bends sideways
+    nx, ny = -dy / dist, dx / dist  # unit normal
+    c1 = (x0 + dx * 0.3 + nx * bow, y0 + dy * 0.3 + ny * bow)
+    c2 = (x0 + dx * 0.7 + nx * bow * 0.6, y0 + dy * 0.7 + ny * bow * 0.6)
+    steps = max(8, min(90, int(dist / 9)))
+    points = []
+    for i in range(1, steps + 1):
+        t = i / steps
+        t = t * t * t * (10 - 15 * t + 6 * t * t)  # minimum-jerk easing
+        u = 1 - t
+        x = u ** 3 * x0 + 3 * u * u * t * c1[0] + 3 * u * t * t * c2[0] + t ** 3 * x1
+        y = u ** 3 * y0 + 3 * u * u * t * c1[1] + 3 * u * t * t * c2[1] + t ** 3 * y1
+        points.append((round(x), round(y)))
+    points[-1] = (x1, y1)
+    return points
+
+
+def _glide(pos, pace=1.0):
+    """Move the pointer to pos: a jump in instant mode, a hand-like movement otherwise.
+    Raises MovedByUser if someone moves the mouse while it glides."""
+    if not _speed:
+        _set_cursor(*pos)
+        return
+    start = cursor_pos()
+    dist = math.hypot(pos[0] - start[0], pos[1] - start[1])
+    # Fitts's law: far targets take longer, but not proportionally longer (about 0.15-0.6 s).
+    duration = (0.12 + 0.11 * math.log2(1 + dist / 25)) * _speed["pace"] * pace * random.uniform(0.85, 1.15)
+    path = human_path(start, pos)
+    gap = duration / len(path)
+    last = start
+    for point in path:
+        here = cursor_pos()
+        if abs(here[0] - last[0]) + abs(here[1] - last[1]) > 40:  # the user has the mouse
+            raise MovedByUser("Stopped: the mouse was moved by hand while the agent was moving it.")
+        _set_cursor(*point)
+        last = point
+        time.sleep(gap)
+
+
 def click(pos, button="left", clicks=1):
     """Click at screen pos (x, y), or wherever the cursor is when pos is None."""
     if pos:
-        user32.SetCursorPos(*pos)
+        _glide(pos)
+        _pause(0.06, 0.16)  # aim before pressing
         time.sleep(0.02)  # let the app register the hover before the press
     down, up = BUTTON_FLAGS[button]
     for n in range(clicks):
-        _send(_mouse(down), _mouse(up))
+        if _speed:
+            _send(_mouse(down))
+            time.sleep(random.uniform(0.05, 0.11))  # a press lasts a moment
+            _send(_mouse(up))
+        else:
+            _send(_mouse(down), _mouse(up))
         if n < clicks - 1:
-            time.sleep(0.05)
+            time.sleep(random.uniform(0.08, 0.13) if _speed else 0.05)  # stays inside the double-click time
+
+
+def _wheel(flag, pos, notches):
+    if pos:
+        _glide(pos)
+        _pause(0.05, 0.12)
+        time.sleep(0.02)
+    if not _speed:
+        _send(_mouse(flag, notches * 120))
+        return
+    step = 1 if notches > 0 else -1
+    for _ in range(abs(notches)):  # one notch at a time, like a finger on a wheel
+        _send(_mouse(flag, step * 120))
+        time.sleep(random.uniform(0.03, 0.08) * _speed["pace"])
 
 
 def scroll(pos, notches):
-    if pos:
-        user32.SetCursorPos(*pos)
-        time.sleep(0.02)
-    _send(_mouse(0x0800, notches * 120))
+    _wheel(0x0800, pos, notches)
+
+
+def hscroll(pos, notches):
+    """Horizontal wheel: positive scrolls right."""
+    _wheel(0x1000, pos, notches)
+
+
+def move_to(pos):
+    """Move the pointer to screen pos (x, y) without clicking, so the app sees a hover."""
+    _glide(pos)
+    _send(_mouse(0x0001))  # a zero-distance relative move makes apps process WM_MOUSEMOVE
+    time.sleep(0.02)
+
+
+def drag(start, end, button="left", steps=12):
+    """Press at start, move to end, release. Human-like speeds move slower while the button is down."""
+    down, up = BUTTON_FLAGS[button]
+    move_to(start)
+    _pause(0.08, 0.15)
+    _send(_mouse(down))
+    try:
+        _pause(0.08, 0.16)  # people pause after grabbing something
+        if _speed:
+            for point in human_path(start, end):
+                _set_cursor(*point)
+                _send(_mouse(0x0001))
+                time.sleep(random.uniform(0.012, 0.02) * _speed["pace"] * 1.3)
+        else:
+            for i in range(1, steps + 1):
+                time.sleep(0.02)
+                _set_cursor(round(start[0] + (end[0] - start[0]) * i / steps),
+                            round(start[1] + (end[1] - start[1]) * i / steps))
+                _send(_mouse(0x0001))
+        time.sleep(0.05)
+        _pause(0.06, 0.12)
+    finally:
+        _send(_mouse(up))
 
 
 VK = {"enter": 0x0D, "tab": 0x09, "esc": 0x1B, "escape": 0x1B, "space": 0x20,
@@ -250,31 +393,86 @@ def _key(vk, up=False):
     return event
 
 
+def _vk_for(name):
+    if name in VK:
+        return [VK[name]]
+    if len(name) == 1:  # punctuation such as / . , - = [ ] on the current keyboard layout
+        code = user32.VkKeyScanW(name)
+        if code != -1:
+            return ([VK["shift"]] if code & 0x100 else []) + [code & 0xFF]
+    raise ValueError(f"unknown key '{name}' (examples: enter, ctrl+s, alt+f4)")
+
+
 def parse_combo(combo):
-    names = [p.strip().lower() for p in combo.split("+")]
-    if not combo.strip() or any(n not in VK for n in names):
-        raise ValueError(f"unknown key in '{combo}' (examples: enter, ctrl+s, alt+f4)")
-    return [VK[n] for n in names]
+    names = [p.strip().lower() for p in combo.replace("++", "+plus").split("+")]
+    if not combo.strip():
+        raise ValueError("empty key combo (examples: enter, ctrl+s, alt+f4)")
+    vks = []
+    for name in names:
+        vks += [v for v in _vk_for("+" if name == "plus" else name) if v not in vks]
+    return vks
 
 
 def press_combo(combo):
     vks = parse_combo(combo)
-    _send(*[_key(v) for v in vks], *[_key(v, up=True) for v in reversed(vks)])
+    if not _speed:
+        _send(*[_key(v) for v in vks], *[_key(v, up=True) for v in reversed(vks)])
+        return
+    for v in vks:  # modifiers first, one finger at a time
+        _send(_key(v))
+        time.sleep(random.uniform(0.03, 0.07) * _speed["pace"])
+    time.sleep(random.uniform(0.03, 0.06))
+    for v in reversed(vks):
+        _send(_key(v, up=True))
+        time.sleep(random.uniform(0.015, 0.04))
+
+
+def keys_down(combo):
+    """Press and hold a combo (released by keys_up); returns what to release."""
+    vks = parse_combo(combo) if combo else []
+    if vks:
+        _send(*[_key(v) for v in vks])
+    return vks
+
+
+def keys_up(vks):
+    if vks:
+        _send(*[_key(v, up=True) for v in reversed(vks)])
+
+
+def mouse_button(button, down):
+    _send(_mouse(BUTTON_FLAGS[button][0 if down else 1]))
 
 
 def type_text(text, delay=0.01):
-    for ch in text:
+    """Type text. Instant mode waits `delay` between characters; human-like modes type at a
+    person's pace: an uneven rhythm, a little slower after spaces and punctuation, and an
+    occasional pause to think."""
+    for i, ch in enumerate(text):
         if ch == "\n":
             press_combo("enter")
         else:
             raw = ch.encode("utf-16-le")
-            for i in range(0, len(raw), 2):  # surrogate pairs need two units
-                code = int.from_bytes(raw[i:i + 2], "little")
+            for j in range(0, len(raw), 2):  # surrogate pairs need two units
+                code = int.from_bytes(raw[j:j + 2], "little")
                 down, up = INPUT(type=1), INPUT(type=1)
                 down.u.ki = KEYBDINPUT(0, code, 0x4, 0, MAGIC)
                 up.u.ki = KEYBDINPUT(0, code, 0x4 | 0x2, 0, MAGIC)
-                _send(down, up)
-        time.sleep(delay)
+                if _speed:
+                    _send(down)
+                    time.sleep(random.uniform(0.02, 0.06))  # how long the key stays down
+                    _send(up)
+                else:
+                    _send(down, up)
+        if not _speed:
+            time.sleep(delay)
+            continue
+        gap = 1 / random.uniform(*_speed["cps"])
+        if ch in " .,;:!?\n" and i + 1 < len(text):
+            gap += random.uniform(0.04, 0.15)  # word and sentence boundaries
+        if random.random() < 0.03:
+            gap += random.uniform(0.2, 0.5)  # a short pause to think
+        time.sleep(gap * _speed["pace"])
 
 
 def activate(hwnd):
@@ -604,6 +802,9 @@ class App:
         self.minimize = tk.BooleanVar(value=True)
         ttk.Checkbutton(run, text="Minimize ClickBot while running / recording",
                         variable=self.minimize).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.human = tk.BooleanVar(value=False)
+        ttk.Checkbutton(run, text="Human-like mouse movement and typing (slower)",
+                        variable=self.human).grid(row=3, column=0, columnspan=3, sticky="w")
         self.start_btn = ttk.Button(run, text="Start (F6)", command=self.toggle_run)
         self.start_btn.grid(row=0, column=4, rowspan=3, sticky="nsew", padx=(12, 4))
         run.columnconfigure(4, weight=1)
@@ -960,6 +1161,7 @@ class App:
         opts = self._read_opts()
         if not opts:
             return
+        set_input_speed("human" if self.human.get() else "instant")
         target = self.target_hwnd()
         if not target and any(a.get("relative") for a in actions):
             messagebox.showerror("ClickBot", "This script uses positions relative to a target window. "
