@@ -112,7 +112,7 @@ def main():
         verdicts, asked, log = ["allow", "deny", "all"], [], []
 
         def run_task(text):
-            agent.tasks.put((text, dict(pilot.DEFAULTS)))
+            agent.tasks.put((text, dict(pilot.DEFAULTS, ask_before_input=True)))  # this test checks approvals
             while True:
                 kind, data = app.events.get(timeout=60)
                 log.append((kind, data))

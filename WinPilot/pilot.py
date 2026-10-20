@@ -3,7 +3,7 @@
 A tray app with a chat box. You type an instruction; an LLM (a local model served by Lemonade,
 or Claude through the Claude Code CLI) plans it and drives the desktop through the WinControl tools
 (..\\WinControlMCP\\server.py), which keep their failsafe, allowlist and action log.
-Input actions (clicks, typing, dragging, launching apps) wait for your approval unless you allow them.
+The agent acts on its own; per-action approval can be switched on in Settings.
 The Activity tab records what happens on the desktop (activity.py); the agent can read it.
 
 Run:  run_pilot.bat [--hidden]
@@ -70,7 +70,7 @@ DEFAULTS = {
     "claude_cli_model": "",                   # blank: Claude Code's default; or opus, sonnet, haiku, a model id
     "effort": "medium",
     "max_steps": 40,
-    "ask_before_input": True,
+    "ask_before_input": False,                # True: every click/keystroke/launch waits for Allow
     "hide_during_actions": True,
     "record_input": True,                     # log your own clicks and keys (never the text you type)
     "takeover": True,                         # moving the mouse yourself stops the running task
@@ -129,6 +129,7 @@ get_ui_elements(web_only=True) inside browsers, clipboard + ctrl+v to enter long
 arrange_window to move or maximize windows. detect_elements (when available) finds clickable \
 regions by vision in apps without UI elements.
 - After each action, check the result (get_ui_elements again, or a screenshot) before moving on.
+- When the user gives text to type or enter, use it exactly and completely, word for word.
 - The user may have to approve input actions. If one is denied, don't retry it: adjust the plan or ask.
 - If the request is ambiguous, or would delete, overwrite, send, buy or close something the user may \
 care about, stop and ask first.
@@ -888,7 +889,7 @@ class App:
 
     def _welcome(self):
         self._write("info", "Tell me what to do on your desktop, and I'll do it with the mouse and keyboard. "
-                            "I ask before every click, keystroke or app launch. The Activity tab records "
+                            "Move the mouse any time to stop me. The Activity tab records "
                             "what happens on the desktop (never the text you type), and I can read it.")
 
     def _use_example(self, text):

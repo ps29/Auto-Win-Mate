@@ -60,7 +60,7 @@ def main():
         app = StubApp(Path(tempfile.mkdtemp()))
         agent = pilot.Agent(app)
         agent.start()
-        cfg = dict(pilot.DEFAULTS, backend="claude_cli")
+        cfg = dict(pilot.DEFAULTS, backend="claude_cli", ask_before_input=True)  # approvals are checked below
         log = []
 
         def run_task(text, stop_after=None):
