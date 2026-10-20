@@ -1,0 +1,3 @@
+-r ../WinControlMCP/requirements.txt
+anthropic>=1.15,<2
+pystray>=0.19.5

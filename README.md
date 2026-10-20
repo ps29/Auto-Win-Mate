@@ -6,8 +6,9 @@ Windows 11 desktop automation, in two parts:
 |---|---|
 | [`ClickBot/`](ClickBot) | A desktop GUI auto-clicker. Record or build click/keyboard scripts, target a specific window, and replay them with hotkeys. |
 | [`WinControlMCP/`](WinControlMCP) | An [MCP](https://modelcontextprotocol.io) server that lets AI agents see and control the desktop: list windows, read an app's buttons and fields through UI Automation, click, type, scroll and take screenshots. It works with cloud models and with local models served by [Lemonade Server](https://lemonade-server.ai). |
+| [`WinPilot/`](WinPilot) | A tray app where you tell an AI (Claude API or a local Lemonade model) what to do in plain language. It carries the task out with the WinControl tools while you watch, and asks before each click or keystroke. |
 
-Both use the Win32 API directly (`SendInput`, window enumeration, low-level hooks). WinControlMCP reuses ClickBot's input code.
+Both use the Win32 API directly (`SendInput`, window enumeration, low-level hooks). WinControlMCP reuses ClickBot's input code, and WinPilot reuses WinControlMCP's tools.
 
 ## Requirements
 - Windows 10 or 11
@@ -41,6 +42,12 @@ setup.cmd --register               :: ...and register the server with the `claud
 To use it with any other MCP client, run `.venv\Scripts\python.exe server.py` over stdio.
 
 See [WinControlMCP/README.md](WinControlMCP/README.md) for the tool list, safety controls and local-model setup.
+
+## WinPilot
+```bat
+WinPilotun_pilot.bat
+```
+Type a task, approve each action as it comes up, and watch the feed. Ctrl+Alt+Space shows or hides the window. See [WinPilot/README.md](WinPilot/README.md).
 
 ## Safety
 - **Failsafe:** move the mouse into the top-left screen corner to stop all input.
