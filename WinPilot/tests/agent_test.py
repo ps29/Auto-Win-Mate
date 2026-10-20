@@ -1,7 +1,8 @@
 """End-to-end test of WinPilot's agent loop with a scripted model (no LLM or API key needed).
 
 Drives WinControlMCP's throwaway test window (tests/testwin.ps1) through the real tools,
-and checks the approval flow: allow, deny, and "allow all for this task".
+and checks the approval flow (allow, deny, "allow all for this task"), the activity log the
+agent writes and reads, and the activity summary added to the next task.
 WINCONTROL_ALLOWED_EXES is locked to powershell.exe, so no other app receives input.
 
 Run from the WinPilot folder:
@@ -12,6 +13,7 @@ import queue
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -19,6 +21,7 @@ os.environ["WINCONTROL_ALLOWED_EXES"] = "powershell.exe"  # must be set before i
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 import pilot  # noqa: E402
+import activity  # noqa: E402
 
 SERVER_TESTS = HERE.parent.parent / "WinControlMCP" / "tests"
 STATE = SERVER_TESTS / "teststate.txt"
@@ -29,8 +32,10 @@ class ScriptedBackend:
     """Stands in for the LLM: replays a fixed plan, reading element ids from tool results."""
 
     def __init__(self, cfg, tools):
-        assert {t.name for t in tools} >= {"get_ui_elements", "set_text", "click_element"}
-        self.results, self.turn = [], 0
+        assert {t.name for t in tools} >= {"get_ui_elements", "set_text", "click_element", "drag",
+                                           "move_mouse", "get_cursor", "read_activity_log"}
+        self.results, self.turn, self.prompts = [], 0, []
+        ScriptedBackend.instance = self
 
     def mark(self):
         return 0
@@ -39,7 +44,7 @@ class ScriptedBackend:
         pass
 
     def add_user(self, text):
-        pass
+        self.prompts.append(text)
 
     def add_results(self, results):
         self.results.append(results)
@@ -54,18 +59,22 @@ class ScriptedBackend:
         plan = {2: ("set_text", {"element_id": empty, "text": "typed by pilot"}),
                 3: ("click_element", {"element_id": button}),   # denied
                 4: ("click_element", {"element_id": button}),   # "allow all"
-                5: ("click_element", {"element_id": button})}   # runs without asking
+                5: ("click_element", {"element_id": button}),   # runs without asking
+                6: ("read_activity_log", {"source": "agent"})}
         if self.turn in plan:
             name, args = plan[self.turn]
             return "", [(f"c{self.turn}", name, args)], False
-        return "Done.", [], False
+        if self.turn == 7:
+            return "Done.", [], False
+        return "Second task done.", [], False
 
 
 class StubApp:
     hwnd, last_external = -1, 0
 
-    def __init__(self):
+    def __init__(self, folder):
         self.events = queue.Queue()
+        self.log = activity.ActivityLog(folder)
 
     def hide_for_action(self):
         return False
@@ -87,19 +96,25 @@ def main():
         else:
             raise RuntimeError("Test window did not start.")
 
-        app = StubApp()
+        app = StubApp(Path(tempfile.mkdtemp()))
         agent = pilot.Agent(app)
         agent.start()
-        agent.tasks.put(("fill the form", dict(pilot.DEFAULTS)))
         verdicts, asked, log = ["allow", "deny", "all"], [], []
-        while True:
-            kind, data = app.events.get(timeout=60)
-            log.append((kind, data))
-            if kind == "approve":
-                asked.append(data)
-                agent.decide(verdicts[len(asked) - 1])
-            elif kind == "done":
-                break
+
+        def run_task(text):
+            agent.tasks.put((text, dict(pilot.DEFAULTS)))
+            while True:
+                kind, data = app.events.get(timeout=60)
+                log.append((kind, data))
+                if kind == "approve":
+                    asked.append(data)
+                    agent.decide(verdicts[len(asked) - 1])
+                elif kind == "done":
+                    return
+
+        run_task("fill the form")
+        app.log.add("you", "shortcut", "pressed ctrl+s")  # something the user does between tasks
+        run_task("anything else?")
         time.sleep(0.8)  # let the test window write its state
 
         state = dict(part.split("=", 1) for part in STATE.read_text().strip().split("|"))
@@ -110,6 +125,20 @@ def main():
         assert 'Button "Press me"' in asked[1], asked[1]
         assert ("info", "Denied.") in log, log
         assert ("assistant", "Done.") in log, log
+
+        details = [e["detail"] for e in app.log.query(last=0, source="agent")]
+        assert details[0] == 'started task: "fill the form"', details
+        assert details[1].startswith("Read the controls of"), details
+        assert details[2].startswith('Type "typed by pilot"'), details
+        assert details[3].startswith("you denied: Click"), details
+        assert details[4:6] == [details[4]] * 2 and details[4].startswith("Click"), details
+        assert details[6] == "finished task", details
+        log_result = [d for k, d in log if k == "result"][-1]
+        assert "agent  you denied: Click" in log_result, log_result
+        prompts = ScriptedBackend.instance.prompts
+        assert prompts[0] == "fill the form", prompts  # nothing from the user yet
+        assert prompts[1].startswith("What happened on the desktop since your last task"), prompts[1]
+        assert "you    pressed ctrl+s" in prompts[1] and prompts[1].endswith("Task: anything else?"), prompts[1]
         assert state["empty"] == "typed by pilot", state
         assert state["filled"] == "existing user text", state
         assert state["clicks"] == "2", state

@@ -50,6 +50,22 @@ async def run():
     await call("set_text", element_id=empty, text="typed by test")
     await call("click_element", element_id=button)
     await call("click_element", element_id=button, double=True)
+    # Cursor tools: hover, focus/caret readout, drag.
+    pos = re.search(r'\[\d+\] Button "Press me".*? at \((\d+), (\d+)\)', elements)
+    bx, by = int(pos[1]), int(pos[2])
+    await call("move_mouse", x=bx, y=by)
+    cursor, _ = await call("get_cursor")
+    assert f"Mouse at ({bx}, {by})" in cursor and TITLE in cursor, cursor
+    await call("click_element", element_id=empty)
+    cursor, _ = await call("get_cursor")
+    assert "id=emptyBox" in cursor and "Text cursor (caret) at" in cursor, cursor
+    slider = re.search(r'\[\d+\] Slider id=slider at \((\d+), (\d+)\)', elements)
+    thumb = re.search(r'\[\d+\] Thumb "Position" at \((\d+), (\d+)\)', elements)
+    assert slider and thumb, elements
+    # From the thumb (value 0) to the right end of the track.
+    right = 2 * int(slider[1]) - int(thumb[1])
+    await call("drag", from_x=int(thumb[1]), from_y=int(thumb[2]), to_x=right, to_y=int(thumb[2]))
+
     _, shot = await call("screenshot", window=TITLE)
     assert [c.type for c in shot.content] == ["text", "image"], shot.content
     await call("wait", ms=800)
@@ -58,6 +74,7 @@ async def run():
     assert state["filled"] == "existing user text", state
     assert state["empty"] == "typed by test", state
     assert state["clicks"] == "3", state
+    assert int(state["track"]) >= 7, state
 
 
 def main():

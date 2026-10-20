@@ -57,7 +57,9 @@ mcp = MCPServer(
         "focus_window or start_app -> get_ui_elements -> click_element / set_text -> "
         "get_ui_elements again to check the result. Element ids are only valid until the next "
         "get_ui_elements call. Use screenshot plus click(x, y, window=...) for apps that expose "
-        "no UI elements (games, custom-drawn apps). Call wait after actions that open windows. "
+        "no UI elements (games, custom-drawn apps). move_mouse hovers, drag does drag-and-drop, and "
+        "get_cursor shows where the pointer, keyboard focus and text cursor are. "
+        "Call wait after actions that open windows. "
         "Apps may restore previous sessions (e.g. Notepad reopens unsaved tabs): check what a "
         "window contains before editing it, and never delete or overwrite the user's content "
         "or close unsaved work without asking."
@@ -324,9 +326,81 @@ def click(x: int, y: int, button: Literal["left", "right", "middle"] = "left", c
     return f"Clicked {button} x{clicks} at screen ({sx}, {sy}).{note}"
 
 
+def _screen_point(x, y, window):
+    """Client (x, y) of `window`, or screen (x, y) without one -> guarded screen point and focus note."""
+    if window is not None:
+        hwnd = _resolve(window)
+        _guard(hwnd)
+        return cb.client_to_screen(hwnd, x, y), _focus(hwnd)
+    _guard(cb.root_of(cb.user32.WindowFromPoint(wt.POINT(x, y))))
+    return (x, y), ""
+
+
+@tool
+def move_mouse(x: int, y: int, window: str | int | None = None) -> str:
+    """Move the mouse pointer without clicking, e.g. to hover over a menu or show a tooltip.
+    Coordinates work as in click()."""
+    (sx, sy), note = _screen_point(x, y, window)
+    cb.move_to((sx, sy))
+    _log(f"move_mouse ({sx}, {sy})")
+    return f"Moved the mouse to screen ({sx}, {sy}).{note}"
+
+
+@tool
+def drag(from_x: int, from_y: int, to_x: int, to_y: int, window: str | int | None = None,
+         button: Literal["left", "right", "middle"] = "left") -> str:
+    """Press the mouse button at (from_x, from_y), move to (to_x, to_y) and release: drag-and-drop,
+    sliders, selecting text or resizing. Coordinates work as in click()."""
+    start, note = _screen_point(from_x, from_y, window)
+    end, _ = _screen_point(to_x, to_y, window)
+    cb.drag(start, end, button)
+    _log(f"drag {start} -> {end} {button}")
+    return f"Dragged {button} from screen {start} to {end}.{note}"
+
+
+class _GUITHREADINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("flags", wt.DWORD), ("hwndActive", wt.HWND), ("hwndFocus", wt.HWND),
+                ("hwndCapture", wt.HWND), ("hwndMenuOwner", wt.HWND), ("hwndMoveSize", wt.HWND),
+                ("hwndCaret", wt.HWND), ("rcCaret", wt.RECT)]
+
+
+cb.user32.GetGUIThreadInfo.restype = wt.BOOL
+cb.user32.GetGUIThreadInfo.argtypes = (wt.DWORD, ctypes.POINTER(_GUITHREADINFO))
+
+
+@tool
+def get_cursor() -> str:
+    """Where the mouse pointer is, which element has keyboard focus, and where the text cursor
+    (caret) is. Check this before type_text / press_keys to know where the keys will land."""
+    from pywinauto.controls.uiawrapper import UIAWrapper
+    from pywinauto.uia_defines import IUIA
+    from pywinauto.uia_element_info import UIAElementInfo
+
+    x, y = cb.cursor_pos()
+    under = cb.root_of(cb.user32.WindowFromPoint(wt.POINT(x, y)))
+    lines = [f"Mouse at ({x}, {y}) over hwnd={under}: {cb.window_title(under)} [{cb.process_name(under)}]"]
+    fg = cb.root_of(cb.user32.GetForegroundWindow())
+    lines.append(f"Foreground window: hwnd={fg}: {cb.window_title(fg)} [{cb.process_name(fg)}]")
+    try:
+        el = UIAWrapper(UIAElementInfo(IUIA().iuia.GetFocusedElement()))
+        info = el.element_info
+        lines.append("Keyboard focus: " + (_describe(el) or f"{info.control_type} \"{info.name or ''}\""))
+    except Exception:
+        lines.append("Keyboard focus: unknown")
+    gti = _GUITHREADINFO(cbSize=ctypes.sizeof(_GUITHREADINFO))
+    if cb.user32.GetGUIThreadInfo(0, ctypes.byref(gti)) and gti.hwndCaret:
+        r = gti.rcCaret
+        cx, cy = cb.client_to_screen(gti.hwndCaret, r.left, r.top)
+        lines.append(f"Text cursor (caret) at screen ({cx}, {cy}), height {r.bottom - r.top}")
+    else:
+        lines.append("Text cursor position unknown (this app doesn't report it); typing goes to the focused element.")
+    return "\n".join(lines)
+
+
 @tool
 def type_text(text: str, window: str | int | None = None) -> str:
-    """Type text into the focused control (or focus `window` first). Newlines press Enter."""
+    """Type text at the text cursor of the focused control (or focus `window` first). Newlines press
+    Enter. To place the text cursor, click into the field or move it with press_keys."""
     note = _focus(_resolve(window)) if window is not None else ""
     _guard()
     cb.type_text(text)
@@ -338,7 +412,9 @@ def type_text(text: str, window: str | int | None = None) -> str:
 def press_keys(keys: str, window: str | int | None = None) -> str:
     """Press keys or combos, space-separated and in order: e.g. 'ctrl+a delete', 'alt+f4', 'enter'.
     Names: a-z, 0-9, f1-f24, enter, tab, esc, space, backspace, delete, home, end, pageup,
-    pagedown, up, down, left, right, ctrl, shift, alt, win."""
+    pagedown, up, down, left, right, ctrl, shift, alt, win.
+    Moving the text cursor: left/right/up/down, home/end (line), ctrl+home/ctrl+end (document),
+    ctrl+left/ctrl+right (word); add shift to select, e.g. 'shift+end'."""
     combos = keys.split()
     for combo in combos:
         cb.parse_combo(combo)  # validate everything before pressing anything

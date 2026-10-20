@@ -6,7 +6,7 @@ Windows 11 desktop automation, in two parts:
 |---|---|
 | [`ClickBot/`](ClickBot) | A desktop GUI auto-clicker. Record or build click/keyboard scripts, target a specific window, and replay them with hotkeys. |
 | [`WinControlMCP/`](WinControlMCP) | An [MCP](https://modelcontextprotocol.io) server that lets AI agents see and control the desktop: list windows, read an app's buttons and fields through UI Automation, click, type, scroll and take screenshots. It works with cloud models and with local models served by [Lemonade Server](https://lemonade-server.ai). |
-| [`WinPilot/`](WinPilot) | A tray app where you tell an AI (Claude API or a local Lemonade model) what to do in plain language. It carries the task out with the WinControl tools while you watch, and asks before each click or keystroke. |
+| [`WinPilot/`](WinPilot) | A tray app where you tell an AI (Claude API or a local Lemonade model) what to do in plain language. It carries the task out with the mouse and keyboard while you watch, asks before each action, and keeps an activity log of the desktop that the agent can read. |
 
 Both use the Win32 API directly (`SendInput`, window enumeration, low-level hooks). WinControlMCP reuses ClickBot's input code, and WinPilot reuses WinControlMCP's tools.
 
@@ -45,15 +45,16 @@ See [WinControlMCP/README.md](WinControlMCP/README.md) for the tool list, safety
 
 ## WinPilot
 ```bat
-WinPilotun_pilot.bat
+WinPilot
+un_pilot.bat
 ```
-Type a task, approve each action as it comes up, and watch the feed. Ctrl+Alt+Space shows or hides the window. See [WinPilot/README.md](WinPilot/README.md).
+Type a task, approve each action as it comes up, and watch the feed. The Activity tab logs what happens on the desktop (agent actions, window switches, your clicks and shortcuts; typed text is only counted, never stored). Ctrl+Alt+Space shows or hides the window. See [WinPilot/README.md](WinPilot/README.md).
 
 ## Safety
 - **Failsafe:** move the mouse into the top-left screen corner to stop all input.
 - **Allowlist:** `WINCONTROL_ALLOWED_EXES` limits which applications the MCP server may send input to.
 - **Protected text:** `set_text` won't overwrite existing text unless the call explicitly asks to.
-- **Log:** every MCP action is written to `WinControlMCP/actions.log`.
+- **Log:** every MCP action is written to `WinControlMCP/actions.log`. WinPilot's activity log is in `%APPDATA%\WinPilot\logs`.
 - **Admin apps:** Windows blocks input to apps running as Administrator unless the automation runs elevated too. The tools report this as an error rather than failing silently.
 - **Your own work:** don't point automation at apps holding unsaved work you care about. Some apps (e.g. Notepad) restore previous sessions when they launch.
 - **Games:** many online games ban simulated input. Check a game's rules first.

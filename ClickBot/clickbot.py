@@ -232,6 +232,29 @@ def scroll(pos, notches):
     _send(_mouse(0x0800, notches * 120))
 
 
+def move_to(pos):
+    """Move the pointer to screen pos (x, y) without clicking, so the app sees a hover."""
+    user32.SetCursorPos(*pos)
+    _send(_mouse(0x0001))  # a zero-distance relative move makes apps process WM_MOUSEMOVE
+    time.sleep(0.02)
+
+
+def drag(start, end, button="left", steps=12):
+    """Press at start, move in small steps to end, release."""
+    down, up = BUTTON_FLAGS[button]
+    move_to(start)
+    _send(_mouse(down))
+    try:
+        for i in range(1, steps + 1):
+            time.sleep(0.02)
+            user32.SetCursorPos(round(start[0] + (end[0] - start[0]) * i / steps),
+                                round(start[1] + (end[1] - start[1]) * i / steps))
+            _send(_mouse(0x0001))
+        time.sleep(0.05)
+    finally:
+        _send(_mouse(up))
+
+
 VK = {"enter": 0x0D, "tab": 0x09, "esc": 0x1B, "escape": 0x1B, "space": 0x20,
       "backspace": 0x08, "delete": 0x2E, "del": 0x2E, "insert": 0x2D, "home": 0x24,
       "end": 0x23, "pageup": 0x21, "pagedown": 0x22, "left": 0x25, "up": 0x26,

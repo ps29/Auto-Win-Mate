@@ -18,6 +18,8 @@ For other MCP clients, configure a stdio server that runs `.venv\Scripts\python.
 | `get_ui_elements` | A window's buttons, fields, menus... as numbered ids |
 | `click_element` / `set_text` | Click an element, or fill a field |
 | `click` / `type_text` / `press_keys` / `scroll` | Raw mouse and keyboard input |
+| `move_mouse` / `drag` | Hover without clicking; drag-and-drop, sliders, selecting |
+| `get_cursor` | Where the mouse pointer, the keyboard focus and the text cursor (caret) are |
 | `screenshot` | Image of the desktop or a window, with how to map pixels to `click` |
 | `wait` | Pause while the UI updates |
 

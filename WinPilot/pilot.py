@@ -3,7 +3,8 @@
 A tray app with a chat box. You type an instruction; an LLM (the Claude API, or a local
 model served by Lemonade) plans it and drives the desktop through the WinControl tools
 (..\\WinControlMCP\\server.py), which keep their failsafe, allowlist and action log.
-Input actions (clicks, typing, launching apps) wait for your approval unless you allow them.
+Input actions (clicks, typing, dragging, launching apps) wait for your approval unless you allow them.
+The Activity tab records what happens on the desktop (activity.py); the agent can read it.
 
 Run:  run_pilot.bat [--hidden]
 
@@ -24,7 +25,9 @@ import re
 import sys
 import threading
 import time
+import types
 import urllib.error
+import winreg
 import urllib.request
 import tkinter as tk
 from pathlib import Path
@@ -33,6 +36,7 @@ from tkinter import ttk, messagebox
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, os.environ.get("WINPILOT_SERVER_DIR", str(HERE.parent / "WinControlMCP")))
 import server  # noqa: E402  (imports ClickBot too, which makes this process DPI-aware)
+import activity  # noqa: E402
 
 import mss  # noqa: E402
 import pystray  # noqa: E402
@@ -61,6 +65,7 @@ DEFAULTS = {
     "max_steps": 40,
     "ask_before_input": True,
     "hide_during_actions": True,
+    "record_input": True,                     # log your own clicks and keys (never the text you type)
 }
 CLAUDE_MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
 FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
@@ -114,8 +119,13 @@ requests into a small control window called WinPilot. It is hidden from screensh
 lists; never try to interact with it.
 
 How to work:
+- Each task may start with a summary of what happened on the desktop since the last one. Call \
+read_activity_log to see more, e.g. what the user just did or what your earlier actions changed.
 - Start with list_windows. Prefer get_ui_elements with click_element / set_text, which are precise. \
 Use screenshot with click(x, y, window=...) only when an app exposes no usable elements.
+- You control the mouse (click, move_mouse to hover, drag, scroll) and the keyboard (type_text, \
+press_keys; arrows, home/end and ctrl+arrows move the text cursor). Call get_cursor to see where \
+the pointer, keyboard focus and text cursor are before typing.
 - After each action, check the result (get_ui_elements again, or a screenshot) before moving on.
 - The user may have to approve input actions. If one is denied, don't retry it: adjust the plan or ask.
 - If the request is ambiguous, or would delete, overwrite, send, buy or close something the user may \
@@ -239,11 +249,41 @@ class LemonadeBackend:
             parts += [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}} for mime, data in shots]
             self.messages.append({"role": "user", "content": parts})
 
+def friendly_error(e):
+    """Turn API and network errors into something a user can act on."""
+    try:
+        import anthropic
+        if isinstance(e, anthropic.AuthenticationError) or (  # no key at all raises a plain TypeError
+                isinstance(e, (anthropic.AnthropicError, TypeError)) and "authentication" in str(e).lower()):
+            return "No valid Claude API key. Open Settings and add your key (or set ANTHROPIC_API_KEY)."
+        if isinstance(e, anthropic.PermissionDeniedError):
+            return "Your API key can't use this model. Pick another model in Settings."
+        if isinstance(e, anthropic.NotFoundError):
+            return "Model not found. Check the model name in Settings."
+        if isinstance(e, anthropic.RateLimitError):
+            return "The Claude API is rate-limiting you. Wait a minute and try again."
+        if isinstance(e, anthropic.APIConnectionError):
+            return "Can't reach the Claude API. Check your internet connection."
+        if isinstance(e, anthropic.APIStatusError):
+            return f"The Claude API returned an error ({e.status_code}): {e.message}"
+    except ImportError:
+        pass
+    return str(e) if isinstance(e, RuntimeError) else f"{type(e).__name__}: {e}"
+
 # ---------------------------------------------------------------- agent
 
-NEEDS_APPROVAL = {"click_element", "set_text", "click", "type_text", "press_keys", "scroll", "start_app"}
-MOVES_FOCUS = NEEDS_APPROVAL | {"focus_window"}  # the WinPilot window hides while these run
-KEYBOARD = {"type_text", "press_keys"}
+NEEDS_APPROVAL = {"click_element", "set_text", "click", "type_text", "press_keys", "scroll", "start_app", "drag"}
+MOVES_FOCUS = NEEDS_APPROVAL | {"focus_window", "move_mouse", "get_cursor"}  # WinPilot hides while these run
+TARGET_FOCUS = {"type_text", "press_keys", "get_cursor"}  # need the user's window in front, not WinPilot
+LOG_TOOL = types.SimpleNamespace(
+    name="read_activity_log",
+    description="Read the desktop activity log: what the user, you (the agent) and Windows did recently "
+                "(window switches, windows opened/closed, clicks, shortcuts, how much was typed; never the "
+                "typed text). Newest last.",
+    input_schema={"type": "object", "properties": {
+        "last": {"type": "integer", "default": 30, "description": "How many entries (max 200)."},
+        "source": {"type": "string", "enum": ["all", "you", "agent", "system"], "default": "all",
+                   "description": "'you' is the user, 'agent' is you, 'system' is window changes."}}})
 
 
 class Agent(threading.Thread):
@@ -259,6 +299,8 @@ class Agent(threading.Thread):
         self.backend, self.backend_key = None, None
         self.elements = {}  # element id -> description, from the latest get_ui_elements
         self.allow_all = False
+        self.log = app.log
+        self.seen_id = 0  # activity entries up to here were already shown to the model
 
     def emit(self, kind, data=None):
         self.events.put((kind, data))
@@ -272,16 +314,23 @@ class Agent(threading.Thread):
         self.decided.set()
 
     def run(self):
-        self.tool_defs = self.loop.run_until_complete(server.mcp.list_tools())
+        self.tool_defs = self.loop.run_until_complete(server.mcp.list_tools()) + [LOG_TOOL]
         while True:
             text, cfg = self.tasks.get()
             self.stop_flag.clear()
             self.allow_all = not cfg["ask_before_input"]
+            self.log.add("agent", "task", f'started task: "{text[:120]}"')
+            outcome = "finished task"
             try:
                 self._task(text, cfg)
             except Exception as e:
-                self.emit("error", f"{type(e).__name__}: {e}")
+                outcome = "task failed"
+                self.emit("error", friendly_error(e))
             finally:
+                if self.stop_flag.is_set():
+                    outcome = "task stopped by you"
+                self.log.add("agent", "task", outcome)
+                self.seen_id = self.log.last_id
                 self.emit("done")
 
     def _task(self, text, cfg):
@@ -294,7 +343,7 @@ class Agent(threading.Thread):
             self.backend, self.backend_key = make(cfg, self.tool_defs), key
         b = self.backend
         mark = b.mark()
-        b.add_user(text)
+        b.add_user(self._with_recent_activity(text))
         for step in range(cfg["max_steps"]):
             if self.stop_flag.is_set():
                 self.emit("info", "Stopped.")
@@ -319,6 +368,14 @@ class Agent(threading.Thread):
             b.add_results([self._run_tool(*call) for call in calls])
         self.emit("error", f"Stopped after {cfg['max_steps']} steps (the limit is in Settings).")
 
+    def _with_recent_activity(self, text):
+        """Prefix the task with what happened since the model last looked (append-only, so history stays valid)."""
+        recent = [e for e in self.log.query(last=25, after_id=self.seen_id) if e["source"] != "agent"]
+        if not recent:
+            return text
+        lines = "\n".join(activity.format_entry(e) for e in recent)
+        return f"What happened on the desktop since your last task (newest last):\n{lines}\n\nTask: {text}"
+
     def _run_tool(self, call_id, name, args):
         def result(text, images=(), error=False):
             return {"id": call_id, "text": text, "images": list(images), "error": error}
@@ -329,6 +386,16 @@ class Agent(threading.Thread):
             self.emit("tool_error", f"{name}: arguments were not valid JSON")
             return result("Invalid arguments: send a JSON object matching the tool's schema.", error=True)
         self.emit("tool", f"{name}({json.dumps(args, ensure_ascii=False)[:200]})")
+        if name == LOG_TOOL.name:
+            source = args.get("source") if args.get("source") in ("you", "agent", "system") else "all"
+            try:
+                last = max(1, min(int(args.get("last") or 30), 200))
+            except (TypeError, ValueError):
+                last = 30
+            text = "\n".join(activity.format_entry(e) for e in self.log.query(last, source)) or "The log is empty."
+            self.emit("result", text)
+            return result(text)
+        action = self._describe(name, args)
         if args.get("window") not in (None, ""):
             try:
                 if server._resolve(args["window"]) == self.app.hwnd:
@@ -337,22 +404,24 @@ class Agent(threading.Thread):
                 pass  # the tool reports a bad window itself
         if name in NEEDS_APPROVAL and not self.allow_all:
             self.decided.clear()
-            self.emit("approve", self._describe(name, args))
+            self.emit("approve", action)
             self.decided.wait()
             if self.decision == "deny":
                 self.emit("info", "Denied.")
+                self.log.add("agent", "denied", f"you denied: {action}")
                 return result("The user denied this action. Don't retry it; adjust the plan or ask the user.",
                               error=True)
             self.allow_all = self.decision == "all"
         self.emit("status", f"Running {name}...")
         hidden = name in MOVES_FOCUS and self.cfg["hide_during_actions"] and self.app.hide_for_action()
         try:
-            if name in KEYBOARD and args.get("window") is None:
+            if name in TARGET_FOCUS and args.get("window") is None:
                 self.app.restore_target_focus()
             r = self.loop.run_until_complete(server.mcp.call_tool(name, args))
         except Exception as e:
             msg = str(e).removeprefix(f"Error executing tool {name}: ")
             self.emit("tool_error", msg)
+            self.log.add("agent", "error", f"{action} - failed: {(msg.splitlines() or [''])[0][:150]}")
             return result(msg, error=True)
         finally:
             if hidden:
@@ -363,6 +432,7 @@ class Agent(threading.Thread):
             text = "\n".join(l for l in text.splitlines() if not l.startswith(f"hwnd={self.app.hwnd} "))
         if name == "get_ui_elements":
             self.elements = {int(m[1]): m[2] for m in re.finditer(r"^\s*\[(\d+)\] (.+)$", text, re.M)}
+        self.log.add("agent", "action" if name in NEEDS_APPROVAL else "look", action)
         self.emit("result", text)
         for _, data in images:
             self.emit("image", data)
@@ -401,7 +471,16 @@ class Agent(threading.Thread):
             return f"Scroll {'up' if n > 0 else 'down'} {abs(n)}{window(a.get('window'))}"
         if name == "start_app":
             return f"Launch {a.get('command')} {a.get('arguments', '')}".strip()
-        return f"{name} {json.dumps(a)}"
+        if name == "move_mouse":
+            return f"Move the mouse to ({a.get('x')}, {a.get('y')}){window(a.get('window'))}"
+        if name == "drag":
+            return (f"Drag from ({a.get('from_x')}, {a.get('from_y')}) to ({a.get('to_x')}, {a.get('to_y')})"
+                    f"{window(a.get('window'))}")
+        looks = {"list_windows": "List open windows", "get_cursor": "Check the mouse and text cursor",
+                 "get_ui_elements": f"Read the controls of '{a.get('window')}'", "wait": f"Wait {a.get('ms')} ms",
+                 "screenshot": f"Take a screenshot{window(a.get('window')) or ' of the desktop'}",
+                 "focus_window": f"Bring '{a.get('window')}' to the front"}
+        return looks.get(name, f"{name} {json.dumps(a)}")
 
 # ---------------------------------------------------------------- background threads
 
@@ -451,16 +530,74 @@ def tray_image():
 
 # ---------------------------------------------------------------- GUI
 
+EXAMPLES = ["What windows are open right now?",
+            "Open Notepad and write a short to-do list for today",
+            "Open Settings and switch Windows to dark mode",
+            "What did I do on the desktop in the last few minutes?"]
+PALETTES = {
+    "light": {"bg": "#fafafa", "fg": "#1c1c1c", "muted": "#6b6b6b", "user": "#0b5cad", "tool": "#7c3aed",
+              "error": "#c42b1c", "you": "#0b5cad", "agent": "#7c3aed", "system": "#6b6b6b",
+              "ask_bg": "#fff4ce", "ask_fg": "#3b2f00", "view": "#e6e6e6", "ok": "#0f7b0f"},
+    "dark": {"bg": "#1f1f1f", "fg": "#f0f0f0", "muted": "#a0a0a0", "user": "#60a5fa", "tool": "#c4a1ff",
+             "error": "#ff99a4", "you": "#60a5fa", "agent": "#c4a1ff", "system": "#a0a0a0",
+             "ask_bg": "#433519", "ask_fg": "#ffe9a8", "view": "#2b2b2b", "ok": "#6ccb5f"},
+}
+WHO = {"you": "You", "agent": "Agent", "system": "Windows"}
+
+
+def system_theme():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+            return "light" if winreg.QueryValueEx(k, "AppsUseLightTheme")[0] else "dark"
+    except OSError:
+        return "light"
+
+
+def shortcut_path(where):
+    import win32com.client
+    folder = win32com.client.Dispatch("WScript.Shell").SpecialFolders(where)  # "Desktop" or "Startup"
+    return Path(folder) / "WinPilot.lnk"
+
+
+def make_shortcut(where, hidden=False):
+    import win32com.client
+    icon = CONFIG.parent / "winpilot.ico"
+    icon.parent.mkdir(parents=True, exist_ok=True)
+    tray_image().save(icon, sizes=[(16, 16), (32, 32), (48, 48), (64, 64)])
+    link = win32com.client.Dispatch("WScript.Shell").CreateShortCut(str(shortcut_path(where)))
+    link.TargetPath = str(Path(sys.executable).with_name("pythonw.exe"))
+    link.Arguments = f'"{HERE / "pilot.py"}"' + (" --hidden" if hidden else "")
+    link.WorkingDirectory = str(HERE)
+    link.IconLocation = str(icon)
+    link.Description = "WinPilot: tell an AI what to do on your desktop"
+    link.save()
+
 
 class App:
     def __init__(self, root, start_hidden):
-        self.root, self.cfg, self.events = root, load_settings(), queue.Queue()
+        self.root, self.events = root, queue.Queue()
+        self.first_run = not CONFIG.exists()
+        self.cfg = load_settings()
         self.running, self.live_on, self.hold_until = False, False, 0.0
         self.last_external, self._photo = 0, None
+        self.log = activity.ActivityLog(CONFIG.parent / "logs")
+        self.log.listeners.append(lambda entry: self.events.put(("activity", entry)))
+        self.theme = system_theme()
+        self.pal = PALETTES[self.theme]
+        try:
+            import sv_ttk
+            sv_ttk.set_theme(self.theme)
+        except ImportError:
+            pass
         root.title("WinPilot")
+        self._icon = ImageTk.PhotoImage(tray_image())
+        root.iconphoto(True, self._icon)
         scale = root.winfo_fpixels("1i") / 96  # the process is DPI-aware, so sizes are physical pixels
-        root.geometry(f"{round(820 * scale)}x{round(560 * scale)}")
-        root.minsize(round(560 * scale), round(380 * scale))
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(round(920 * scale), int(sw * 0.9)), min(round(620 * scale), int(sh * 0.8))
+        root.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 3}")
+        root.minsize(round(600 * scale), round(420 * scale))
         self._build()
         root.update()
         self.hwnd = int(root.wm_frame(), 16)
@@ -471,89 +608,206 @@ class App:
         self.agent.start()
         Hotkeys(self.events).start()
         LiveView(self).start()
+        activity.DesktopMonitor(self.log, self.hwnd, lambda: self.cfg["record_input"]).start()
         self.tray = pystray.Icon("WinPilot", tray_image(), "WinPilot", pystray.Menu(
             pystray.MenuItem("Show", lambda: self.events.put(("tray", "show")), default=True),
             pystray.MenuItem("Stop task", lambda: self.events.put(("tray", "stop"))),
             pystray.MenuItem("Quit", lambda: self.events.put(("tray", "quit")))))
         self.tray.run_detached()
 
-        self._write("info", "Tell me what to do on your desktop, e.g. \"open Notepad and type a shopping list\".\n"
-                            "Clicks and typing wait for your approval. Ctrl+Alt+Space shows or hides this window; "
-                            "Ctrl+Alt+X or the top-left screen corner stops everything.")
+        self.log.add("system", "app", "WinPilot started")
         self._update_backend_label()
         self._pump()
         self._poll_foreground()
         if start_hidden:
             root.after(200, self.hide)
+        elif self.first_run:
+            root.after(400, lambda: SettingsDialog(self, welcome=True))
+
+    # ---- layout
 
     def _build(self):
-        r = self.root
-        style = ttk.Style()
-        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
+        r, pal = self.root, self.pal
 
-        top = ttk.Frame(r, padding=(8, 6))
+        top = ttk.Frame(r, padding=(12, 10, 12, 6))
         top.pack(fill="x")
-        self.backend_label = ttk.Label(top, font=("Segoe UI", 10, "bold"))
-        self.backend_label.pack(side="left")
-        ttk.Button(top, text="Settings", command=self.open_settings).pack(side="right")
-        ttk.Button(top, text="New chat", command=self.new_chat).pack(side="right", padx=4)
-        self.live_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="Live view", variable=self.live_var,
-                        command=lambda: setattr(self, "live_on", self.live_var.get())).pack(side="right", padx=8)
-        self.status = tk.StringVar(value="Idle")
-        ttk.Label(top, textvariable=self.status, foreground="#555").pack(side="left", padx=12)
+        ttk.Label(top, text="WinPilot", font=("Segoe UI Semibold", 15)).pack(side="left")
+        self.backend_label = ttk.Label(top, foreground=pal["muted"])
+        self.backend_label.pack(side="left", padx=(12, 0), pady=(4, 0))
+        ttk.Button(top, text="Settings", command=lambda: SettingsDialog(self)).pack(side="right")
+        ttk.Button(top, text="New chat", command=self.new_chat).pack(side="right", padx=6)
 
-        # Packed last (after the input row) so it can't squeeze the input off the window.
-        self.panes = panes = ttk.PanedWindow(r, orient="horizontal")
-        feed_frame = ttk.Frame(panes)
-        self.feed = tk.Text(feed_frame, wrap="word", state="disabled", font=("Segoe UI", 10), relief="flat",
-                            padx=8, pady=6, background="#fbfbfb")
-        sb = ttk.Scrollbar(feed_frame, command=self.feed.yview)
-        self.feed.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.feed.pack(side="left", fill="both", expand=True)
-        for tag, opts in {"user": {"foreground": "#1d4ed8", "font": ("Segoe UI", 10, "bold"), "spacing1": 8},
-                          "assistant": {"foreground": "#111", "spacing1": 4},
-                          "tool": {"foreground": "#7c3aed", "font": ("Consolas", 9)},
-                          "result": {"foreground": "#666", "font": ("Consolas", 9), "lmargin1": 18, "lmargin2": 18},
-                          "error": {"foreground": "#b91c1c"},
-                          "info": {"foreground": "#666", "font": ("Segoe UI", 9, "italic")}}.items():
-            self.feed.tag_configure(tag, **opts)
-        panes.add(feed_frame, weight=3)
+        # Bottom area first, so the panes can never squeeze it off the window.
+        self.statusbar = ttk.Frame(r, padding=(12, 2, 12, 8))
+        self.statusbar.pack(fill="x", side="bottom")
+        self.status_dot = tk.Label(self.statusbar, text="●", fg=pal["ok"], bg=self._bg(), font=("Segoe UI", 10))
+        self.status_dot.pack(side="left")
+        self.status = tk.StringVar(value="Ready")
+        ttk.Label(self.statusbar, textvariable=self.status).pack(side="left", padx=(4, 12))
+        self.progress = ttk.Progressbar(self.statusbar, mode="indeterminate", length=120)
+        self.foreground = tk.StringVar()
+        ttk.Label(self.statusbar, textvariable=self.foreground, foreground=pal["muted"]).pack(side="right")
 
-        view = ttk.Frame(panes)
-        self.view_caption = ttk.Label(view, text="Agent's view", foreground="#555")
-        self.view_caption.pack(anchor="w")
-        self.view = tk.Label(view, background="#e5e7eb")
-        self.view.pack(fill="both", expand=True)
-        panes.add(view, weight=2)
+        bottom = ttk.Frame(r, padding=(12, 6, 12, 4))
+        bottom.pack(fill="x", side="bottom")
+        self.examples = ttk.Frame(bottom)
+        self.examples.pack(fill="x", pady=(0, 6))
+        ttk.Label(self.examples, text="Try:", foreground=pal["muted"]).pack(side="left", padx=(0, 6))
+        for text in EXAMPLES[:3]:
+            ttk.Button(self.examples, text=text if len(text) < 40 else text[:38] + "...",
+                       command=lambda t=text: self._use_example(t)).pack(side="left", padx=(0, 6))
+        row = ttk.Frame(bottom)
+        row.pack(fill="x")
+        self.input = tk.Text(row, height=3, wrap="word", font=("Segoe UI", 11), relief="flat", padx=8, pady=6,
+                             bg=pal["bg"], fg=pal["fg"], insertbackground=pal["fg"],
+                             highlightthickness=1, highlightbackground=pal["view"], highlightcolor=pal["user"])
+        self.input.pack(side="left", fill="x", expand=True)
+        self.input.bind("<Return>", self._on_enter)
+        buttons = ttk.Frame(row)
+        buttons.pack(side="right", padx=(8, 0))
+        self.send_btn = ttk.Button(buttons, text="Send", style="Accent.TButton", command=self.send, width=9)
+        self.send_btn.pack(fill="x")
+        self.stop_btn = ttk.Button(buttons, text="Stop", command=self.stop, state="disabled", width=9)
+        self.stop_btn.pack(fill="x", pady=(6, 0))
+        ttk.Label(bottom, text="Enter sends · Shift+Enter new line · Ctrl+Alt+Space show/hide · "
+                               "Ctrl+Alt+X or mouse in the top-left corner stops", foreground=pal["muted"],
+                  font=("Segoe UI", 8)).pack(anchor="w", pady=(4, 0))
 
-        self.approval = tk.Frame(r, background="#fef3c7", padx=10, pady=8)
-        self.approval_text = tk.Label(self.approval, background="#fef3c7", font=("Segoe UI", 10, "bold"),
-                                      justify="left", anchor="w")
+        self.approval = tk.Frame(r, bg=pal["ask_bg"], padx=12, pady=10)
+        self.approval_text = tk.Label(self.approval, bg=pal["ask_bg"], fg=pal["ask_fg"], justify="left",
+                                      anchor="w", font=("Segoe UI Semibold", 10))
         self.approval_text.pack(side="left", fill="x", expand=True)
         ttk.Button(self.approval, text="Deny", command=lambda: self._decide("deny")).pack(side="right")
         ttk.Button(self.approval, text="Allow all this task",
-                   command=lambda: self._decide("all")).pack(side="right", padx=4)
+                   command=lambda: self._decide("all")).pack(side="right", padx=6)
         ttk.Button(self.approval, text="Allow", style="Accent.TButton",
-                   command=lambda: self._decide("allow")).pack(side="right", padx=4)
+                   command=lambda: self._decide("allow")).pack(side="right")
 
-        bottom = ttk.Frame(r, padding=8)
-        bottom.pack(fill="x", side="bottom")
-        self.input = tk.Text(bottom, height=3, wrap="word", font=("Segoe UI", 11), relief="solid", borderwidth=1)
-        self.input.pack(side="left", fill="x", expand=True)
-        self.input.bind("<Return>", self._on_enter)
-        buttons = ttk.Frame(bottom)
-        buttons.pack(side="right", padx=(8, 0))
-        self.send_btn = ttk.Button(buttons, text="Send", style="Accent.TButton", command=self.send)
-        self.send_btn.pack(fill="x")
-        self.stop_btn = ttk.Button(buttons, text="Stop", command=self.stop, state="disabled")
-        self.stop_btn.pack(fill="x", pady=(4, 0))
-        self.foreground = tk.StringVar()
-        ttk.Label(r, textvariable=self.foreground, foreground="#777", padding=(8, 0)).pack(
-            fill="x", side="bottom", before=bottom)
-        panes.pack(fill="both", expand=True, padx=8)
+        self.panes = panes = ttk.PanedWindow(r, orient="horizontal")
+        self.tabs = ttk.Notebook(panes)
+        panes.add(self.tabs, weight=3)
+        self._build_chat_tab()
+        self._build_activity_tab()
+
+        view = ttk.Frame(panes, padding=(8, 0, 0, 0))
+        self.view_caption = ttk.Label(view, text="Agent's view", foreground=pal["muted"])
+        self.view_caption.pack(anchor="w")
+        self.view = tk.Label(view, bg=pal["view"], fg=pal["muted"], text="Screenshots the agent takes\nshow up here.")
+        self.view.pack(fill="both", expand=True, pady=(4, 6))
+        self.live_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(view, text="Live desktop view", variable=self.live_var,
+                        command=lambda: setattr(self, "live_on", self.live_var.get())).pack(anchor="w")
+        self.cursor_info = tk.StringVar()
+        ttk.Label(view, textvariable=self.cursor_info, foreground=pal["muted"], font=("Segoe UI", 8),
+                  wraplength=320, justify="left").pack(anchor="w", pady=(4, 0))
+        panes.add(view, weight=2)
+        panes.pack(fill="both", expand=True, padx=12)
         self.input.focus_set()
+
+    def _bg(self):
+        return ttk.Style().lookup("TFrame", "background") or self.pal["bg"]
+
+    def _build_chat_tab(self):
+        pal = self.pal
+        frame = ttk.Frame(self.tabs)
+        self.feed = tk.Text(frame, wrap="word", state="disabled", font=("Segoe UI", 10), relief="flat",
+                            padx=12, pady=10, bg=pal["bg"], fg=pal["fg"], highlightthickness=0)
+        sb = ttk.Scrollbar(frame, command=self.feed.yview)
+        self.feed.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.feed.pack(side="left", fill="both", expand=True)
+        for tag, opts in {"user": {"foreground": pal["user"], "font": ("Segoe UI Semibold", 10), "spacing1": 10},
+                          "assistant": {"foreground": pal["fg"], "spacing1": 4, "spacing3": 4},
+                          "tool": {"foreground": pal["tool"], "font": ("Consolas", 9), "spacing1": 2},
+                          "result": {"foreground": pal["muted"], "font": ("Consolas", 9),
+                                     "lmargin1": 18, "lmargin2": 18},
+                          "error": {"foreground": pal["error"]},
+                          "info": {"foreground": pal["muted"], "font": ("Segoe UI", 9, "italic")}}.items():
+            self.feed.tag_configure(tag, **opts)
+        self.tabs.add(frame, text="  Chat  ")
+        self._welcome()
+
+    def _build_activity_tab(self):
+        pal = self.pal
+        frame = ttk.Frame(self.tabs, padding=(0, 6, 0, 0))
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x", pady=(0, 6))
+        self.who_filter = tk.StringVar(value="Everyone")
+        box = ttk.Combobox(bar, textvariable=self.who_filter, state="readonly", width=10,
+                           values=["Everyone", "You", "Agent", "Windows"])
+        box.pack(side="left")
+        box.bind("<<ComboboxSelected>>", lambda e: self._reload_activity())
+        self.search = tk.StringVar()
+        search = ttk.Entry(bar, textvariable=self.search, width=22)
+        search.pack(side="left", padx=6)
+        search.bind("<KeyRelease>", lambda e: self._reload_activity())
+        ttk.Button(bar, text="Open log folder",
+                   command=lambda: (self.log.folder.mkdir(parents=True, exist_ok=True),
+                                    os.startfile(self.log.folder))).pack(side="right")
+        ttk.Button(bar, text="Clear view", command=lambda: self.activity.delete(*self.activity.get_children())
+                   ).pack(side="right", padx=6)
+        self.record_btn = ttk.Button(bar, command=self._toggle_recording, width=13)
+        self.record_btn.pack(side="right")
+        self._set_record_label()
+
+        table = ttk.Frame(frame)
+        table.pack(fill="both", expand=True)
+        cols = ("time", "who", "what", "window")
+        self.activity = ttk.Treeview(table, columns=cols, show="headings", selectmode="browse")
+        for col, title, width, stretch in (("time", "Time", 70, False), ("who", "Who", 70, False),
+                                           ("what", "What happened", 280, True), ("window", "Window", 220, True)):
+            self.activity.heading(col, text=title, anchor="w")
+            self.activity.column(col, width=width, stretch=stretch, anchor="w")
+        for source in WHO:
+            self.activity.tag_configure(source, foreground=pal[source])
+        sb = ttk.Scrollbar(table, command=self.activity.yview)
+        self.activity.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.activity.pack(side="left", fill="both", expand=True)
+        self.tabs.add(frame, text="  Activity  ")
+
+    def _welcome(self):
+        self._write("info", "Tell me what to do on your desktop, and I'll do it with the mouse and keyboard. "
+                            "I ask before every click, keystroke or app launch. The Activity tab records "
+                            "what happens on the desktop (never the text you type), and I can read it.")
+
+    def _use_example(self, text):
+        self.input.delete("1.0", "end")
+        self.input.insert("1.0", text)
+        self.input.focus_set()
+
+    # ---- activity tab
+
+    def _matches(self, e):
+        who = {"You": "you", "Agent": "agent", "Windows": "system"}.get(self.who_filter.get())
+        needle = self.search.get().strip().lower()
+        return ((not who or e["source"] == who)
+                and (not needle or needle in f'{e["detail"]} {e["window"]} {e["exe"]}'.lower()))
+
+    def _add_activity_row(self, e):
+        if not self._matches(e):
+            return
+        at_bottom = self.activity.yview()[1] > 0.98
+        window = f'{e["window"]}  [{e["exe"]}]' if e["window"] else ""
+        self.activity.insert("", "end", values=(e["time"][11:], WHO[e["source"]], e["detail"], window),
+                             tags=(e["source"],))
+        rows = self.activity.get_children()
+        if len(rows) > 3000:
+            self.activity.delete(*rows[:500])
+        if at_bottom:
+            self.activity.yview_moveto(1.0)
+
+    def _reload_activity(self):
+        self.activity.delete(*self.activity.get_children())
+        for e in self.log.query(last=3000):
+            self._add_activity_row(e)
+
+    def _toggle_recording(self):
+        self.log.paused = not self.log.paused
+        self._set_record_label()
+
+    def _set_record_label(self):
+        self.record_btn.configure(text="▶  Resume" if self.log.paused else "●  Recording")
 
     # ---- window management (some of these run on the agent thread)
 
@@ -576,7 +830,7 @@ class App:
         user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
 
     def restore_target_focus(self):
-        """Typing must not land in WinPilot itself: give focus back to the window the user was in."""
+        """Keys must not land in WinPilot itself: give focus back to the window the user was in."""
         fg = cb.root_of(user32.GetForegroundWindow())
         if fg in (0, self.hwnd) and self.last_external and user32.IsWindow(self.last_external):
             cb.activate(self.last_external)
@@ -586,8 +840,10 @@ class App:
         if fg and fg != self.hwnd:
             self.last_external = fg
         if self.last_external:
-            self.foreground.set(f"Last active window: {cb.window_title(self.last_external)} "
-                                f"[{cb.process_name(self.last_external)}]")
+            self.foreground.set(f"Active: {cb.window_title(self.last_external)[:60]}")
+        x, y = cb.cursor_pos()
+        under = cb.root_of(user32.WindowFromPoint(wt.POINT(x, y)))
+        self.cursor_info.set(f"Mouse ({x}, {y}) over {cb.window_title(under)[:50] or cb.process_name(under)}")
         self.root.after(300, self._poll_foreground)
 
     # ---- chat
@@ -602,11 +858,25 @@ class App:
         if not text or self.running:
             return
         self.input.delete("1.0", "end")
+        self.examples.pack_forget()
+        self.tabs.select(0)
         self._write("user", f"You: {text}")
-        self.running = True
-        self.send_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
+        self._set_running(True)
         self.agent.tasks.put((text, dict(self.cfg)))
+
+    def _set_running(self, running):
+        self.running = running
+        self.send_btn.configure(state="disabled" if running else "normal")
+        self.stop_btn.configure(state="normal" if running else "disabled")
+        if running:
+            self.progress.pack(side="left")
+            self.progress.start(12)
+            self.status_dot.configure(fg=self.pal["tool"])
+        else:
+            self.progress.stop()
+            self.progress.pack_forget()
+            self.status_dot.configure(fg=self.pal["ok"])
+            self.status.set("Ready")
 
     def stop(self):
         if self.running:
@@ -620,7 +890,8 @@ class App:
         self.feed.configure(state="normal")
         self.feed.delete("1.0", "end")
         self.feed.configure(state="disabled")
-        self._write("info", "New chat.")
+        self._welcome()
+        self.examples.pack(fill="x", pady=(0, 6), before=self.examples.master.winfo_children()[1])
 
     def _decide(self, verdict):
         self.approval.pack_forget()
@@ -638,7 +909,7 @@ class App:
         img = img.copy()
         img.thumbnail((w, h))
         self._photo = ImageTk.PhotoImage(img)
-        self.view.configure(image=self._photo)
+        self.view.configure(image=self._photo, text="")
 
     def _notify(self, text):
         if not user32.IsWindowVisible(self.hwnd):
@@ -667,6 +938,8 @@ class App:
                         self._notify(data)
                 elif kind == "info":
                     self._write("info", data)
+                elif kind == "activity":
+                    self._add_activity_row(data)
                 elif kind == "image":
                     self.hold_until = time.time() + 6  # keep the agent's screenshot up for a moment
                     self._show_image(Image.open(io.BytesIO(base64.b64decode(data))), "Agent's view: last screenshot")
@@ -674,18 +947,17 @@ class App:
                     if time.time() > self.hold_until:
                         self._show_image(data, "Live desktop")
                 elif kind == "approve":
-                    self.approval_text.configure(text=f"Allow?  {data}", wraplength=max(300, self.root.winfo_width() - 380))
-                    self.approval.pack(fill="x", side="bottom", padx=8, pady=(6, 0), before=self.panes)
+                    self.approval_text.configure(text=f"Allow?   {data}",
+                                                 wraplength=max(300, self.root.winfo_width() - 420))
+                    self.approval.pack(fill="x", side="bottom", padx=12, pady=(6, 0), before=self.panes)
                     self.status.set("Waiting for your approval")
+                    self.status_dot.configure(fg=self.pal["error"])
                     if not user32.IsWindowVisible(self.hwnd) or user32.IsIconic(self.hwnd):
                         self.show()
                     self.root.bell()
                 elif kind == "done":
-                    self.running = False
                     self.approval.pack_forget()
-                    self.send_btn.configure(state="normal")
-                    self.stop_btn.configure(state="disabled")
-                    self.status.set("Idle")
+                    self._set_running(False)
                     last = self.feed.get("end-2l", "end-1c").strip()
                     self._notify(last or "Task finished.")
                 elif kind == "hotkey":
@@ -697,6 +969,10 @@ class App:
                         self.show()
                 elif kind == "tray":
                     {"show": self.show, "stop": self.stop, "quit": self.quit}[data]()
+                elif kind == "call":  # run a function on the Tk thread
+                    data()
+                if kind == "status" and self.running:
+                    self.status_dot.configure(fg=self.pal["tool"])
         except queue.Empty:
             pass
         self.root.after(50, self._pump)
@@ -705,9 +981,6 @@ class App:
         c = self.cfg
         model = c["claude_model"] if c["backend"] == "claude" else c["lemonade_model"]
         self.backend_label.configure(text=f"{'Claude API' if c['backend'] == 'claude' else 'Lemonade'} · {model}")
-
-    def open_settings(self):
-        SettingsDialog(self)
 
     def apply_settings(self, cfg):
         self.cfg = cfg
@@ -721,58 +994,105 @@ class App:
         os._exit(0)
 
 
+def test_connection(cfg):
+    """Raise on failure, return a short success message."""
+    if cfg["backend"] == "lemonade":
+        models = lemonade_models(cfg["lemonade_url"])
+        if cfg["lemonade_model"] not in models:
+            return f"Connected, but '{cfg['lemonade_model']}' isn't installed. Available: {', '.join(models[:6])}"
+        return f"Connected to Lemonade. {cfg['lemonade_model']} is available."
+    import anthropic
+    client = anthropic.Anthropic(api_key=cfg["api_key"] or None, max_retries=1, timeout=60)
+    client.messages.create(model=cfg["claude_model"], max_tokens=16, output_config={"effort": "low"},
+                           messages=[{"role": "user", "content": "Reply with OK."}])
+    return f"Connected to the Claude API. {cfg['claude_model']} answered."
+
+
 class SettingsDialog(tk.Toplevel):
-    def __init__(self, app):
+    def __init__(self, app, welcome=False):
         super().__init__(app.root)
         self.app, c = app, app.cfg
         self.title("WinPilot settings")
         self.resizable(False, False)
         self.transient(app.root)
-        f = ttk.Frame(self, padding=14)
+        f = ttk.Frame(self, padding=18)
         f.pack(fill="both")
+        f.columnconfigure(1, weight=1)
         self.vars = {k: (tk.BooleanVar if isinstance(v, bool) else tk.StringVar)(value=v) for k, v in c.items()}
         self.backend = tk.StringVar(value="Claude API" if c["backend"] == "claude" else "Lemonade (local)")
         row = 0
 
         def add(label, widget, note=None):
             nonlocal row
-            ttk.Label(f, text=label).grid(row=row, column=0, sticky="w", pady=3, padx=(0, 10))
-            widget.grid(row=row, column=1, sticky="we", pady=3)
+            if label:
+                ttk.Label(f, text=label).grid(row=row, column=0, sticky="w", pady=4, padx=(0, 12))
+            widget.grid(row=row, column=1, sticky="we", pady=4)
             if note:
                 row += 1
-                ttk.Label(f, text=note, foreground="#777", font=("Segoe UI", 8)).grid(row=row, column=1, sticky="w")
+                ttk.Label(f, text=note, foreground=app.pal["muted"], font=("Segoe UI", 8), wraplength=420,
+                          justify="left").grid(row=row, column=1, sticky="w")
             row += 1
 
-        add("Model provider", ttk.Combobox(f, textvariable=self.backend, state="readonly", width=40,
-                                           values=["Claude API", "Lemonade (local)"]))
-        ttk.Separator(f).grid(row=row, column=0, columnspan=2, sticky="we", pady=6)
-        row += 1
-        add("Claude model", ttk.Combobox(f, textvariable=self.vars["claude_model"], values=CLAUDE_MODELS, width=40))
+        def section(text):
+            nonlocal row
+            ttk.Label(f, text=text, font=("Segoe UI Semibold", 11)).grid(row=row, column=0, columnspan=2,
+                                                                         sticky="w", pady=(14 if row else 0, 2))
+            row += 1
+
+        if welcome:
+            ttk.Label(f, text="Welcome to WinPilot! Pick the AI model to use, test it, then save.",
+                      font=("Segoe UI Semibold", 11)).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 8))
+            row += 1
+        section("Model")
+        add("Provider", ttk.Combobox(f, textvariable=self.backend, state="readonly", width=44,
+                                     values=["Claude API", "Lemonade (local)"]))
+        add("Claude model", ttk.Combobox(f, textvariable=self.vars["claude_model"], values=CLAUDE_MODELS, width=44))
         add("Effort", ttk.Combobox(f, textvariable=self.vars["effort"], state="readonly",
-                                   values=["low", "medium", "high"], width=40),
-            "Higher is more careful but slower.")
-        add("API key", ttk.Entry(f, textvariable=self.vars["api_key"], show="*", width=42),
-            "Blank uses ANTHROPIC_API_KEY or your `ant auth login` profile. Stored encrypted for your Windows user.")
-        ttk.Separator(f).grid(row=row, column=0, columnspan=2, sticky="we", pady=6)
-        row += 1
-        add("Lemonade URL", ttk.Entry(f, textvariable=self.vars["lemonade_url"], width=42))
+                                   values=["low", "medium", "high"], width=44), "Higher is more careful but slower.")
+        add("API key", ttk.Entry(f, textvariable=self.vars["api_key"], show="•", width=46),
+            "Blank uses ANTHROPIC_API_KEY or an `ant auth login` profile. Stored encrypted for your Windows user.")
+        add("Lemonade URL", ttk.Entry(f, textvariable=self.vars["lemonade_url"], width=46))
         lm = ttk.Frame(f)
-        self.lemonade_box = ttk.Combobox(lm, textvariable=self.vars["lemonade_model"], width=31)
+        self.lemonade_box = ttk.Combobox(lm, textvariable=self.vars["lemonade_model"], width=33)
         self.lemonade_box.pack(side="left", fill="x", expand=True)
-        ttk.Button(lm, text="Refresh", command=self._refresh_models).pack(side="left", padx=(4, 0))
+        ttk.Button(lm, text="Refresh", command=self._refresh_models).pack(side="left", padx=(6, 0))
         add("Lemonade model", lm, "Use a vision model (e.g. Qwen3-VL) so screenshots work. Needs ctx_size >= 32768.")
-        ttk.Separator(f).grid(row=row, column=0, columnspan=2, sticky="we", pady=6)
-        row += 1
+        test = ttk.Frame(f)
+        ttk.Button(test, text="Test connection", command=self._test).pack(side="left")
+        self.test_result = ttk.Label(test, wraplength=330, justify="left")
+        self.test_result.pack(side="left", padx=10)
+        add("", test)
+
+        section("Safety and privacy")
         add("Max steps per task", ttk.Spinbox(f, from_=5, to=200, textvariable=self.vars["max_steps"], width=8))
-        add("", ttk.Checkbutton(f, text="Ask before clicking, typing or launching apps",
+        add("", ttk.Checkbutton(f, text="Ask before clicking, typing, dragging or launching apps",
                                 variable=self.vars["ask_before_input"]))
         add("", ttk.Checkbutton(f, text="Hide this window while the agent acts",
                                 variable=self.vars["hide_during_actions"]))
+        add("", ttk.Checkbutton(f, text="Record my own clicks and key presses in the Activity log",
+                                variable=self.vars["record_input"]),
+            "Only shortcuts and key names are recorded. Typed text is counted, never stored.")
+
+        section("Shortcuts")
+        try:
+            startup_on = shortcut_path("Startup").exists()
+        except Exception:
+            startup_on = False
+        self.startup = tk.BooleanVar(value=startup_on)
+        add("", ttk.Checkbutton(f, text="Start WinPilot in the tray when Windows starts", variable=self.startup))
+        add("", ttk.Button(f, text="Create desktop shortcut", command=self._desktop_shortcut))
+
         btns = ttk.Frame(f)
-        btns.grid(row=row, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        btns.grid(row=row, column=0, columnspan=2, sticky="e", pady=(16, 0))
         ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
-        ttk.Button(btns, text="Save", command=self._save).pack(side="right", padx=6)
+        ttk.Button(btns, text="Save", style="Accent.TButton", command=self._save).pack(side="right", padx=8)
         self.grab_set()
+
+    def _collect(self):
+        cfg = {k: v.get() for k, v in self.vars.items()}
+        cfg["backend"] = "claude" if self.backend.get() == "Claude API" else "lemonade"
+        cfg["max_steps"] = max(1, int(cfg["max_steps"]))
+        return {k: v.strip() if isinstance(v, str) else v for k, v in cfg.items()}
 
     def _refresh_models(self):
         try:
@@ -781,15 +1101,43 @@ class SettingsDialog(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("WinPilot", str(e), parent=self)
 
-    def _save(self):
-        cfg = {k: v.get() for k, v in self.vars.items()}
-        cfg["backend"] = "claude" if self.backend.get() == "Claude API" else "lemonade"
+    def _test(self):
         try:
-            cfg["max_steps"] = max(1, int(cfg["max_steps"]))
+            cfg = self._collect()
+        except ValueError:
+            return
+        self.test_result.configure(text="Testing...", foreground=self.app.pal["muted"])
+
+        def run():
+            try:
+                msg, color = test_connection(cfg), self.app.pal["ok"]
+            except Exception as e:
+                msg, color = friendly_error(e), self.app.pal["error"]
+            self.app.events.put(("call", lambda: self.winfo_exists() and self.test_result.configure(
+                text=msg, foreground=color)))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _desktop_shortcut(self):
+        try:
+            make_shortcut("Desktop")
+            messagebox.showinfo("WinPilot", "Added a WinPilot shortcut to your desktop.", parent=self)
+        except Exception as e:
+            messagebox.showerror("WinPilot", f"Couldn't create the shortcut: {e}", parent=self)
+
+    def _save(self):
+        try:
+            cfg = self._collect()
         except ValueError:
             messagebox.showerror("WinPilot", "Max steps must be a number.", parent=self)
             return
-        cfg = {k: v.strip() if isinstance(v, str) else v for k, v in cfg.items()}
+        try:
+            link = shortcut_path("Startup")
+            if self.startup.get() and not link.exists():
+                make_shortcut("Startup", hidden=True)
+            elif not self.startup.get() and link.exists():
+                link.unlink()
+        except Exception as e:
+            messagebox.showerror("WinPilot", f"Couldn't change the startup shortcut: {e}", parent=self)
         if self.app.running:
             messagebox.showinfo("WinPilot", "Settings will apply to the next task.", parent=self)
         self.app.apply_settings(cfg)
