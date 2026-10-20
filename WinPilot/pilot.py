@@ -447,7 +447,7 @@ class Agent(threading.Thread):
         return True
 
     def _run_screen_action(self, call_id, name, args, toolset):
-        """A computer toolset member (Claude) or a parsed action (Fara-7B / UI-TARS)."""
+        """A parsed screen action from a local computer-use model (Fara-7B / UI-TARS)."""
         def result(text, images=(), error=False):
             return {"id": call_id, "text": text, "images": list(images), "error": error}
 
