@@ -13,3 +13,13 @@ WinControlMCP/tests/teststate.txt
 .idea/
 Thumbs.db
 Desktop.ini
+
+# Optional OmniParser weights (setup_omniparser.cmd)
+WinControlMCP/omniparser/
+*.log.*
+
+# Build output (packaging\build.cmd)
+build/
+dist/
+packaging/winpilot.ico
+packaging/version_info.txt

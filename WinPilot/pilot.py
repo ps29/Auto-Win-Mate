@@ -33,10 +33,17 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, messagebox
 
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, os.environ.get("WINPILOT_SERVER_DIR", str(HERE.parent / "WinControlMCP")))
+FROZEN = getattr(sys, "frozen", False)  # running as the packaged WinPilot.exe
+HERE = Path(sys.executable).parent if FROZEN else Path(__file__).resolve().parent
+if FROZEN:  # the install folder may be read-only: keep the action log with the user's data
+    os.environ.setdefault("WINCONTROL_LOG", str(Path(os.environ.get("LOCALAPPDATA", HERE)) / "WinPilot" / "actions.log"))
+else:
+    sys.path.insert(0, os.environ.get("WINPILOT_SERVER_DIR", str(HERE.parent / "WinControlMCP")))
 import server  # noqa: E402  (imports ClickBot too, which makes this process DPI-aware)
 import activity  # noqa: E402
+import computer  # noqa: E402
+import housekeeping  # noqa: E402
+import omniparser  # noqa: E402  (WinControlMCP\omniparser.py: optional vision element detection)
 
 import mss  # noqa: E402
 import pystray  # noqa: E402
@@ -66,9 +73,19 @@ DEFAULTS = {
     "ask_before_input": True,
     "hide_during_actions": True,
     "record_input": True,                     # log your own clicks and keys (never the text you type)
+    "computer_use": True,                     # give Claude its built-in screen/mouse/keyboard toolset
+    "local_style": "tools",                   # "tools" (tool calling), "fara" (Fara-7B) or "uitars" (UI-TARS-1.5)
+    "takeover": True,                         # moving the mouse yourself stops the running task
+    "keep_logs_days": 30,                     # delete daily activity logs older than this
 }
+LOCAL_STYLES = {"tools": "Tool calling (Qwen3-VL and similar)", "fara": "Fara-7B (screenshots only)",
+                "uitars": "UI-TARS-1.5 (screenshots only)"}
 CLAUDE_MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
 FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
+TOOLSET_MODELS = {"claude-fable-5-1", "claude-mythos-5-1", "claude-fable-5", "claude-mythos-5", "claude-opus-5-5",
+                  "claude-opus-5", "claude-sonnet-5-5", "claude-sonnet-5", "claude-opus-4-8", "claude-haiku-5-5"}
+# The computer toolset covers these raw-input tools, so Claude gets one way to do each thing.
+REPLACED_BY_TOOLSET = {"click", "scroll", "screenshot", "wait", "move_mouse", "drag", "type_text", "press_keys"}
 
 
 class _Blob(ctypes.Structure):
@@ -121,16 +138,28 @@ lists; never try to interact with it.
 How to work:
 - Each task may start with a summary of what happened on the desktop since the last one. Call \
 read_activity_log to see more, e.g. what the user just did or what your earlier actions changed.
-- Start with list_windows. Prefer get_ui_elements with click_element / set_text, which are precise. \
-Use screenshot with click(x, y, window=...) only when an app exposes no usable elements.
-- You control the mouse (click, move_mouse to hover, drag, scroll) and the keyboard (type_text, \
-press_keys; arrows, home/end and ctrl+arrows move the text cursor). Call get_cursor to see where \
-the pointer, keyboard focus and text cursor are before typing.
+- Start with list_windows. Prefer get_ui_elements with click_element / set_text, which are precise.
+{input_help}
+- Use wait_for instead of fixed waits, read_page_text to read a page or document, \
+get_ui_elements(web_only=True) inside browsers, clipboard + ctrl+v to enter long text, and \
+arrange_window to move or maximize windows. detect_elements (when available) finds clickable \
+regions by vision in apps without UI elements.
 - After each action, check the result (get_ui_elements again, or a screenshot) before moving on.
 - The user may have to approve input actions. If one is denied, don't retry it: adjust the plan or ask.
 - If the request is ambiguous, or would delete, overwrite, send, buy or close something the user may \
 care about, stop and ask first.
 - When you are finished, reply in one or two sentences: what you did, or what is blocking you."""
+
+
+INPUT_HELP_TOOLS = """- Use screenshot with click(x, y, window=...) only when an app exposes no usable elements.
+- You control the mouse (click, move_mouse to hover, drag, scroll) and the keyboard (type_text, \
+press_keys; arrows, home/end and ctrl+arrows move the text cursor). Call get_cursor to see where \
+the pointer, keyboard focus and text cursor are before typing."""
+INPUT_HELP_TOOLSET = """- For everything else use the computer toolset (screenshot, zoom, clicks, mouse_move, drag, \
+scroll, type, key). Its screenshots show the whole desktop; its coordinates are pixels of those \
+screenshots. Zoom in to read small text. End each group of actions with a screenshot so you can \
+verify the result before continuing. Arrows, home/end and ctrl+arrows move the text cursor; \
+get_cursor tells you where keyboard focus and the text cursor are."""
 
 
 class Refused(Exception):
@@ -144,8 +173,13 @@ class ClaudeBackend:
         import anthropic
         self.client = anthropic.Anthropic(api_key=cfg["api_key"] or None, max_retries=3)
         self.model, self.effort = cfg["claude_model"], cfg["effort"]
+        self.toolset = bool(cfg.get("computer_use")) and self.model in TOOLSET_MODELS
         self.tools = [{"name": t.name, "description": t.description or "", "input_schema": t.input_schema}
-                      for t in tools]
+                      for t in tools if not (self.toolset and t.name in REPLACED_BY_TOOLSET)]
+        if self.toolset:
+            self.tools.append({"type": "computer_toolset_20260801"})
+            self.screen = computer.Screen(computer.claude_fit)
+        self.system = SYSTEM.format(input_help=INPUT_HELP_TOOLSET if self.toolset else INPUT_HELP_TOOLS)
         self.messages = []
 
     def mark(self):
@@ -162,14 +196,15 @@ class ClaudeBackend:
         if self.model in FALLBACK_MODELS:  # re-run a declined request on Anthropic's recommended model
             extra = {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"}
         r = self.client.beta.messages.create(
-            model=self.model, max_tokens=16000, system=SYSTEM, tools=self.tools, messages=self.messages,
+            model=self.model, max_tokens=16000, system=self.system, tools=self.tools, messages=self.messages,
             cache_control={"type": "ephemeral"}, output_config={"effort": self.effort}, **extra)
         if r.stop_reason == "refusal":
             why = getattr(r.stop_details, "explanation", None) if r.stop_details else None
             raise Refused(why or "The model declined this request.")
-        self.messages.append({"role": "assistant", "content": r.content})
-        text = "\n".join(b.text for b in r.content if b.type == "text").strip()
-        calls = [(b.id, b.name, b.input) for b in r.content if b.type == "tool_use"]
+        content = [b.to_dict() for b in r.content]  # plain dicts keep every field, e.g. toolset_name
+        self.messages.append({"role": "assistant", "content": content})
+        text = "\n".join(b["text"] for b in content if b["type"] == "text").strip()
+        calls = [(b["id"], b["name"], b["input"], b.get("toolset_name")) for b in content if b["type"] == "tool_use"]
         return text, calls, r.stop_reason == "pause_turn"
 
     def add_results(self, results):
@@ -178,8 +213,10 @@ class ClaudeBackend:
             content = [{"type": "text", "text": res["text"] or "(no output)"}]
             content += [{"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}}
                         for mime, data in res["images"]]
-            blocks.append({"type": "tool_result", "tool_use_id": res["id"], "content": content,
-                           "is_error": res["error"]})
+            block = {"type": "tool_result", "tool_use_id": res["id"], "content": content, "is_error": res["error"]}
+            if res.get("toolset"):
+                block["toolset_name"] = res["toolset"]  # required on every computer toolset result
+            blocks.append(block)
         self.messages.append({"role": "user", "content": blocks})
 
 
@@ -206,7 +243,7 @@ class LemonadeBackend:
         self.url, self.model = cfg["lemonade_url"].rstrip("/"), cfg["lemonade_model"]
         self.tools = [{"type": "function", "function": {"name": t.name, "description": t.description or "",
                                                         "parameters": t.input_schema}} for t in tools]
-        self.messages = [{"role": "system", "content": SYSTEM}]
+        self.messages = [{"role": "system", "content": SYSTEM.format(input_help=INPUT_HELP_TOOLS)}]
 
     def mark(self):
         return len(self.messages)
@@ -249,6 +286,64 @@ class LemonadeBackend:
             parts += [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}} for mime, data in shots]
             self.messages.append({"role": "user", "content": parts})
 
+class VisionLocalBackend:
+    """Local computer-use models that act from screenshots alone: Fara-7B and UI-TARS-1.5.
+    Each turn the model gets a fresh screenshot and answers with actions in its own text format,
+    which computer.parse_fara / parse_uitars turn into WinPilot's action dicts."""
+
+    KEEP_SCREENSHOTS = 3
+
+    def __init__(self, cfg, tools, style):
+        self.url, self.model, self.style = cfg["lemonade_url"].rstrip("/"), cfg["lemonade_model"], style
+        self.screen = computer.Screen(computer.fara_fit if style == "fara" else computer.uitars_fit)
+        self.messages = [{"role": "system", "content": computer.FARA_SYSTEM}] if style == "fara" else []
+        self.base = len(self.messages)
+        self.turn = 0
+
+    def mark(self):
+        return len(self.messages)
+
+    def rollback(self, mark):
+        del self.messages[max(self.base, mark):]
+
+    def _image(self):
+        mime, data = self.screen.screenshot()
+        return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
+
+    def add_user(self, text):
+        prompt = computer.UITARS_PROMPT + text if self.style == "uitars" else text
+        self.messages.append({"role": "user", "content": [{"type": "text", "text": prompt}, self._image()]})
+
+    def step(self):
+        shots = [m for m in self.messages if m["role"] == "user" and isinstance(m["content"], list)]
+        for m in shots[:-self.KEEP_SCREENSHOTS]:  # small contexts: drop old screenshots, keep their text
+            m["content"] = [part for part in m["content"] if part["type"] == "text"] or "(screenshot removed)"
+        body = {"model": self.model, "messages": self.messages, "temperature": 0}
+        reply = _post_json(self.url + "/chat/completions", body)["choices"][0]["message"].get("content") or ""
+        reply = re.sub(r"<think>.*?</think>", "", reply, flags=re.S).strip()
+        self.messages.append({"role": "assistant", "content": reply})
+        parse = computer.parse_fara if self.style == "fara" else computer.parse_uitars
+        try:
+            thought, actions = parse(reply)
+        except (ValueError, SyntaxError) as e:
+            if self.turn == 0 or not reply:
+                raise RuntimeError(f"The model's reply isn't in the {LOCAL_STYLES[self.style]} format ({e}). "
+                                   "Check the model and 'Local model type' in Settings.") from e
+            return reply, [], False  # plain text after some actions: treat it as the final answer
+        self.turn += 1
+        finish = next((a for a in actions if a["kind"] == "finish"), None)
+        if finish:
+            status = {"success": "Done.", "failure": "I couldn't finish this task."}
+            end = status.get(finish.get("text", ""), finish.get("text", ""))
+            return "\n".join(t for t in (thought, end) if t) or "Done.", [], False
+        return thought, [(f"v{self.turn}_{i}", "vision", a, "vision") for i, a in enumerate(actions)], False
+
+    def add_results(self, results):
+        notes = [r["text"] for r in results if r["error"]]
+        text = "Previous action failed: " + " / ".join(notes) if notes else "Action done. Here is the new screen."
+        self.messages.append({"role": "user", "content": [{"type": "text", "text": text}, self._image()]})
+
+
 def friendly_error(e):
     """Turn API and network errors into something a user can act on."""
     try:
@@ -272,7 +367,8 @@ def friendly_error(e):
 
 # ---------------------------------------------------------------- agent
 
-NEEDS_APPROVAL = {"click_element", "set_text", "click", "type_text", "press_keys", "scroll", "start_app", "drag"}
+NEEDS_APPROVAL = {"click_element", "set_text", "click", "type_text", "press_keys", "scroll", "start_app", "drag",
+                  "clipboard"}
 MOVES_FOCUS = NEEDS_APPROVAL | {"focus_window", "move_mouse", "get_cursor"}  # WinPilot hides while these run
 TARGET_FOCUS = {"type_text", "press_keys", "get_cursor"}  # need the user's window in front, not WinPilot
 LOG_TOOL = types.SimpleNamespace(
@@ -301,6 +397,8 @@ class Agent(threading.Thread):
         self.allow_all = False
         self.log = app.log
         self.seen_id = 0  # activity entries up to here were already shown to the model
+        self.awaiting = False  # waiting for the user to approve: moving the mouse then isn't a takeover
+        self.calm_until = 0.0  # the user's hand is still on the mouse right after Send or Allow
 
     def emit(self, kind, data=None):
         self.events.put((kind, data))
@@ -314,10 +412,12 @@ class Agent(threading.Thread):
         self.decided.set()
 
     def run(self):
-        self.tool_defs = self.loop.run_until_complete(server.mcp.list_tools()) + [LOG_TOOL]
+        self.tool_defs = [t for t in self.loop.run_until_complete(server.mcp.list_tools())
+                          if t.name != "detect_elements" or omniparser.available()] + [LOG_TOOL]
         while True:
             text, cfg = self.tasks.get()
             self.stop_flag.clear()
+            self.calm_until = time.monotonic() + 2.0
             self.allow_all = not cfg["ask_before_input"]
             self.log.add("agent", "task", f'started task: "{text[:120]}"')
             outcome = "finished task"
@@ -331,12 +431,21 @@ class Agent(threading.Thread):
                     outcome = "task stopped by you"
                 self.log.add("agent", "task", outcome)
                 self.seen_id = self.log.last_id
+                try:
+                    self._suggest_new_chat()
+                except Exception:
+                    pass  # a hint is never worth killing the agent thread (the UI would wait forever)
                 self.emit("done")
 
     def _task(self, text, cfg):
         self.cfg = cfg
+        style = cfg.get("local_style", "tools")
         if cfg["backend"] == "claude":
-            key, make = ("claude", cfg["claude_model"], cfg["effort"], cfg["api_key"]), ClaudeBackend
+            key = ("claude", cfg["claude_model"], cfg["effort"], cfg["api_key"], cfg.get("computer_use"))
+            make = ClaudeBackend
+        elif style in ("fara", "uitars"):
+            key = ("vision", cfg["lemonade_url"], cfg["lemonade_model"], style)
+            make = lambda c, t: VisionLocalBackend(c, t, style)  # noqa: E731
         else:
             key, make = ("lemonade", cfg["lemonade_url"], cfg["lemonade_model"]), LemonadeBackend
         if self.backend is None or key != self.backend_key:
@@ -365,8 +474,22 @@ class Agent(threading.Thread):
                 if more:
                     continue
                 return
-            b.add_results([self._run_tool(*call) for call in calls])
+            b.add_results(self._run_calls(calls))
         self.emit("error", f"Stopped after {cfg['max_steps']} steps (the limit is in Settings).")
+
+    def _suggest_new_chat(self):
+        """Claude chats can't drop old screenshots (that would break the history), so long ones get slow
+        and costly. Suggest a fresh chat once per chat when they pile up."""
+        b = self.backend
+        if not isinstance(b, ClaudeBackend) or getattr(b, "suggested_new_chat", False):
+            return
+        shots = sum(1 for m in getattr(b, "messages", []) if isinstance(m["content"], list) for block in m["content"]
+                    if block.get("type") == "tool_result" and isinstance(block.get("content"), list)
+                    for part in block["content"] if part.get("type") == "image")
+        if shots >= 40:
+            b.suggested_new_chat = True
+            self.emit("info", f"This chat holds {shots} screenshots, which makes each reply slower and costlier. "
+                              "Click New chat when you start something unrelated.")
 
     def _with_recent_activity(self, text):
         """Prefix the task with what happened since the model last looked (append-only, so history stays valid)."""
@@ -375,6 +498,78 @@ class Agent(threading.Thread):
             return text
         lines = "\n".join(activity.format_entry(e) for e in recent)
         return f"What happened on the desktop since your last task (newest last):\n{lines}\n\nTask: {text}"
+
+    def _run_calls(self, calls):
+        """Run one model turn's calls in order. Screen actions stop at the first failure, as the
+        computer toolset requires; the rest of that turn's screen actions are reported as not run."""
+        results, failed = [], False
+        for call_id, name, args, toolset in (c if len(c) == 4 else (*c, None) for c in calls):
+            if toolset and failed:
+                results.append({"id": call_id, "text": "Not executed: an earlier computer action in this turn failed.",
+                                "images": [], "error": True, "toolset": toolset if toolset == "computer" else None})
+            elif toolset:
+                results.append(self._run_screen_action(call_id, name, args, toolset))
+                failed = results[-1]["error"]
+            else:
+                results.append(self._run_tool(call_id, name, args))
+        return results
+
+    def _approve(self, action):
+        """Ask the user (unless they allowed everything for this task). True if allowed."""
+        if self.allow_all:
+            return True
+        self.decided.clear()
+        self.awaiting = True
+        self.emit("approve", action)
+        self.decided.wait()
+        self.awaiting, self.calm_until = False, time.monotonic() + 2.0
+        if self.decision == "deny":
+            self.emit("info", "Denied.")
+            self.log.add("agent", "denied", f"you denied: {action}")
+            return False
+        self.allow_all = self.decision == "all"
+        return True
+
+    def _run_screen_action(self, call_id, name, args, toolset):
+        """A computer toolset member (Claude) or a parsed action (Fara-7B / UI-TARS)."""
+        def result(text, images=(), error=False):
+            return {"id": call_id, "text": text, "images": list(images), "error": error,
+                    "toolset": toolset if toolset == "computer" else None}
+
+        if self.stop_flag.is_set():
+            return result("Not run: the user stopped the task.", error=True)
+        screen = self.backend.screen
+        try:
+            act = args if toolset == "vision" else computer.from_claude(name, args or {})
+            action = computer.describe(act, screen)
+        except (KeyError, TypeError, ValueError) as e:
+            self.emit("tool_error", f"{name}: {e}")
+            return result(f"Invalid action: {e}", error=True)
+        self.emit("tool", f"{name if toolset == 'computer' else act['kind']}: {action}")
+        is_input = act["kind"] in computer.INPUT_KINDS
+        if is_input and not self._approve(action):
+            return result("The user denied this action. Don't retry it; adjust the plan or ask the user.", error=True)
+        self.emit("status", f"Running {act['kind']}...")
+        hidden = ((is_input or act["kind"] == "move") and self.cfg["hide_during_actions"]
+                  and self.app.hide_for_action())
+        try:
+            if act["kind"] in ("type", "key", "hold"):
+                self.app.restore_target_focus()
+            text, image = computer.perform(act, screen)
+        except Exception as e:
+            msg = str(e) or type(e).__name__
+            self.emit("tool_error", msg)
+            self.log.add("agent", "error", f"{action} - failed: {msg.splitlines()[0][:150]}")
+            return result(msg, error=True)
+        finally:
+            if hidden:
+                self.app.show_after_action()
+        self.log.add("agent", "action" if is_input else "look", action)
+        if text != "OK":
+            self.emit("result", text)
+        if image:
+            self.emit("image", image[1])
+        return result(text, [image] if image else [])
 
     def _run_tool(self, call_id, name, args):
         def result(text, images=(), error=False):
@@ -402,16 +597,8 @@ class Agent(threading.Thread):
                     return result("That is the WinPilot control window; it can't be automated.", error=True)
             except ValueError:
                 pass  # the tool reports a bad window itself
-        if name in NEEDS_APPROVAL and not self.allow_all:
-            self.decided.clear()
-            self.emit("approve", action)
-            self.decided.wait()
-            if self.decision == "deny":
-                self.emit("info", "Denied.")
-                self.log.add("agent", "denied", f"you denied: {action}")
-                return result("The user denied this action. Don't retry it; adjust the plan or ask the user.",
-                              error=True)
-            self.allow_all = self.decision == "all"
+        if name in NEEDS_APPROVAL and not self._approve(action):
+            return result("The user denied this action. Don't retry it; adjust the plan or ask the user.", error=True)
         self.emit("status", f"Running {name}...")
         hidden = name in MOVES_FOCUS and self.cfg["hide_during_actions"] and self.app.hide_for_action()
         try:
@@ -476,7 +663,16 @@ class Agent(threading.Thread):
         if name == "drag":
             return (f"Drag from ({a.get('from_x')}, {a.get('from_y')}) to ({a.get('to_x')}, {a.get('to_y')})"
                     f"{window(a.get('window'))}")
+        if name == "clipboard":
+            return ("Read your clipboard" if a.get("action") == "get"
+                    else f'Put "{str(a.get("text", ""))[:80]}" on the clipboard')
+        if name == "wait_for":
+            return f"Wait for {repr(a.get('text')) + ' in ' if a.get('text') else ''}'{a.get('window')}'"
+        if name == "arrange_window":
+            return f"{str(a.get('action', '')).title()} '{a.get('window')}'"
         looks = {"list_windows": "List open windows", "get_cursor": "Check the mouse and text cursor",
+                 "read_page_text": f"Read the text of '{a.get('window')}'",
+                 "detect_elements": f"Find clickable regions by vision{window(a.get('window'))}",
                  "get_ui_elements": f"Read the controls of '{a.get('window')}'", "wait": f"Wait {a.get('ms')} ms",
                  "screenshot": f"Take a screenshot{window(a.get('window')) or ' of the desktop'}",
                  "focus_window": f"Bring '{a.get('window')}' to the front"}
@@ -566,8 +762,11 @@ def make_shortcut(where, hidden=False):
     icon.parent.mkdir(parents=True, exist_ok=True)
     tray_image().save(icon, sizes=[(16, 16), (32, 32), (48, 48), (64, 64)])
     link = win32com.client.Dispatch("WScript.Shell").CreateShortCut(str(shortcut_path(where)))
-    link.TargetPath = str(Path(sys.executable).with_name("pythonw.exe"))
-    link.Arguments = f'"{HERE / "pilot.py"}"' + (" --hidden" if hidden else "")
+    if FROZEN:
+        link.TargetPath, link.Arguments = sys.executable, "--hidden" if hidden else ""
+    else:
+        link.TargetPath = str(Path(sys.executable).with_name("pythonw.exe"))
+        link.Arguments = f'"{HERE / "pilot.py"}"' + (" --hidden" if hidden else "")
     link.WorkingDirectory = str(HERE)
     link.IconLocation = str(icon)
     link.Description = "WinPilot: tell an AI what to do on your desktop"
@@ -608,7 +807,11 @@ class App:
         self.agent.start()
         Hotkeys(self.events).start()
         LiveView(self).start()
-        activity.DesktopMonitor(self.log, self.hwnd, lambda: self.cfg["record_input"]).start()
+        activity.DesktopMonitor(
+            self.log, self.hwnd, record_input=lambda: self.cfg["record_input"],
+            watch_takeover=lambda: (self.running and self.cfg["takeover"] and not self.agent.awaiting
+                                    and time.monotonic() > self.agent.calm_until),
+            on_takeover=lambda: self.events.put(("takeover", None))).start()
         self.tray = pystray.Icon("WinPilot", tray_image(), "WinPilot", pystray.Menu(
             pystray.MenuItem("Show", lambda: self.events.put(("tray", "show")), default=True),
             pystray.MenuItem("Stop task", lambda: self.events.put(("tray", "stop"))),
@@ -616,6 +819,7 @@ class App:
         self.tray.run_detached()
 
         self.log.add("system", "app", "WinPilot started")
+        self._housekeeping()
         self._update_backend_label()
         self._pump()
         self._poll_foreground()
@@ -775,6 +979,16 @@ class App:
         self.input.delete("1.0", "end")
         self.input.insert("1.0", text)
         self.input.focus_set()
+
+    def _housekeeping(self):
+        """Delete old activity logs and rotate the action log now, then once a day."""
+        def run():
+            try:
+                housekeeping.clean(int(self.cfg["keep_logs_days"]))
+            except Exception as e:
+                self.events.put(("info", f"Cleanup failed: {e}"))
+        threading.Thread(target=run, daemon=True).start()
+        self.root.after(24 * 3600 * 1000, self._housekeeping)
 
     # ---- activity tab
 
@@ -969,6 +1183,10 @@ class App:
                         self.show()
                 elif kind == "tray":
                     {"show": self.show, "stop": self.stop, "quit": self.quit}[data]()
+                elif kind == "takeover":
+                    if self.running:
+                        self.agent.stop()
+                        self._write("info", "You moved the mouse, so I stopped. (Turn this off in Settings.)")
                 elif kind == "call":  # run a function on the Tk thread
                     data()
                 if kind == "status" and self.running:
@@ -1015,12 +1233,22 @@ class SettingsDialog(tk.Toplevel):
         self.title("WinPilot settings")
         self.resizable(False, False)
         self.transient(app.root)
-        f = ttk.Frame(self, padding=18)
-        f.pack(fill="both")
-        f.columnconfigure(1, weight=1)
+        outer = ttk.Frame(self, padding=16)
+        outer.pack(fill="both", expand=True)
+        if welcome:
+            ttk.Label(outer, text="Welcome to WinPilot! Pick the AI model to use, test it, then save.",
+                      font=("Segoe UI Semibold", 11)).pack(anchor="w", pady=(0, 10))
+        tabs = ttk.Notebook(outer)
+        tabs.pack(fill="both", expand=True)
         self.vars = {k: (tk.BooleanVar if isinstance(v, bool) else tk.StringVar)(value=v) for k, v in c.items()}
         self.backend = tk.StringVar(value="Claude API" if c["backend"] == "claude" else "Lemonade (local)")
-        row = 0
+        f, row = None, 0
+
+        def section(text):  # each section is a tab, so the dialog fits on small screens
+            nonlocal f, row
+            f, row = ttk.Frame(tabs, padding=16), 0
+            f.columnconfigure(1, weight=1)
+            tabs.add(f, text=f"  {text}  ")
 
         def add(label, widget, note=None):
             nonlocal row
@@ -1029,39 +1257,35 @@ class SettingsDialog(tk.Toplevel):
             widget.grid(row=row, column=1, sticky="we", pady=4)
             if note:
                 row += 1
-                ttk.Label(f, text=note, foreground=app.pal["muted"], font=("Segoe UI", 8), wraplength=420,
-                          justify="left").grid(row=row, column=1, sticky="w")
+                ttk.Label(f, text=note, foreground=app.pal["muted"], wraplength=400,
+                          justify="left").grid(row=row, column=1, sticky="w", pady=(0, 4))
             row += 1
 
-        def section(text):
-            nonlocal row
-            ttk.Label(f, text=text, font=("Segoe UI Semibold", 11)).grid(row=row, column=0, columnspan=2,
-                                                                         sticky="w", pady=(14 if row else 0, 2))
-            row += 1
-
-        if welcome:
-            ttk.Label(f, text="Welcome to WinPilot! Pick the AI model to use, test it, then save.",
-                      font=("Segoe UI Semibold", 11)).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 8))
-            row += 1
         section("Model")
-        add("Provider", ttk.Combobox(f, textvariable=self.backend, state="readonly", width=44,
+        add("Provider", ttk.Combobox(f, textvariable=self.backend, state="readonly", width=40,
                                      values=["Claude API", "Lemonade (local)"]))
-        add("Claude model", ttk.Combobox(f, textvariable=self.vars["claude_model"], values=CLAUDE_MODELS, width=44))
+        add("Claude model", ttk.Combobox(f, textvariable=self.vars["claude_model"], values=CLAUDE_MODELS, width=40))
         add("Effort", ttk.Combobox(f, textvariable=self.vars["effort"], state="readonly",
-                                   values=["low", "medium", "high"], width=44), "Higher is more careful but slower.")
-        add("API key", ttk.Entry(f, textvariable=self.vars["api_key"], show="•", width=46),
+                                   values=["low", "medium", "high"], width=40), "Higher is more careful but slower.")
+        add("API key", ttk.Entry(f, textvariable=self.vars["api_key"], show="•", width=42),
             "Blank uses ANTHROPIC_API_KEY or an `ant auth login` profile. Stored encrypted for your Windows user.")
-        add("Lemonade URL", ttk.Entry(f, textvariable=self.vars["lemonade_url"], width=46))
+        add("", ttk.Checkbutton(f, text="Let Claude see and click the screen directly (computer use)",
+                                variable=self.vars["computer_use"]),
+            "Claude's built-in screenshot, zoom, mouse and keyboard tools, used alongside the precise UI "
+            "element tools. Works with Claude 5 models.")
+
+        section("Local model")
+        add("Lemonade URL", ttk.Entry(f, textvariable=self.vars["lemonade_url"], width=42))
         lm = ttk.Frame(f)
-        self.lemonade_box = ttk.Combobox(lm, textvariable=self.vars["lemonade_model"], width=33)
+        self.lemonade_box = ttk.Combobox(lm, textvariable=self.vars["lemonade_model"], width=29)
         self.lemonade_box.pack(side="left", fill="x", expand=True)
         ttk.Button(lm, text="Refresh", command=self._refresh_models).pack(side="left", padx=(6, 0))
-        add("Lemonade model", lm, "Use a vision model (e.g. Qwen3-VL) so screenshots work. Needs ctx_size >= 32768.")
-        test = ttk.Frame(f)
-        ttk.Button(test, text="Test connection", command=self._test).pack(side="left")
-        self.test_result = ttk.Label(test, wraplength=330, justify="left")
-        self.test_result.pack(side="left", padx=10)
-        add("", test)
+        add("Model", lm, "Use a vision model (e.g. Qwen3-VL) so screenshots work. Needs ctx_size >= 32768.")
+        self.style = tk.StringVar(value=LOCAL_STYLES.get(c.get("local_style", "tools"), LOCAL_STYLES["tools"]))
+        add("Model type", ttk.Combobox(f, textvariable=self.style, state="readonly", width=40,
+                                       values=list(LOCAL_STYLES.values())),
+            "Fara-7B and UI-TARS-1.5 are trained to use a computer from screenshots alone; pick the type "
+            "that matches the model above.")
 
         section("Safety and privacy")
         add("Max steps per task", ttk.Spinbox(f, from_=5, to=200, textvariable=self.vars["max_steps"], width=8))
@@ -1069,29 +1293,53 @@ class SettingsDialog(tk.Toplevel):
                                 variable=self.vars["ask_before_input"]))
         add("", ttk.Checkbutton(f, text="Hide this window while the agent acts",
                                 variable=self.vars["hide_during_actions"]))
+        add("", ttk.Checkbutton(f, text="Stop the task when I move the mouse myself",
+                                variable=self.vars["takeover"]))
         add("", ttk.Checkbutton(f, text="Record my own clicks and key presses in the Activity log",
                                 variable=self.vars["record_input"]),
             "Only shortcuts and key names are recorded. Typed text is counted, never stored.")
 
-        section("Shortcuts")
+        section("More")
+        add("Vision detection", ttk.Label(
+            f, wraplength=400, justify="left", foreground=app.pal["ok" if omniparser.available() else "muted"],
+            text="OmniParser is installed: the agent can find buttons by vision in apps that expose no UI "
+                 "elements." if omniparser.available() else
+                 "Not part of the installed app (it needs about 1 GB). It is available when running WinPilot "
+                 "from the source repository." if FROZEN else
+                 "Not installed. To let the agent find buttons by vision in games and custom-drawn apps, "
+                 "run WinControlMCP\\setup_omniparser.cmd once (downloads about 1 GB)."))
+        keep = ttk.Frame(f)
+        ttk.Spinbox(keep, from_=1, to=3650, textvariable=self.vars["keep_logs_days"], width=6).pack(side="left")
+        ttk.Label(keep, text="days").pack(side="left", padx=(6, 0))
+        ttk.Button(keep, text="Clean up now", command=self._clean_now).pack(side="left", padx=(16, 0))
+        add("Keep activity logs", keep, "Older daily logs are deleted automatically once a day. The action log "
+                                        "rotates at 5 MB. maintenance.cmd does a deeper cleanup and health check.")
+        self.clean_result = ttk.Label(f, foreground=app.pal["muted"], wraplength=400, justify="left")
+        add("", self.clean_result)
         try:
             startup_on = shortcut_path("Startup").exists()
         except Exception:
             startup_on = False
         self.startup = tk.BooleanVar(value=startup_on)
-        add("", ttk.Checkbutton(f, text="Start WinPilot in the tray when Windows starts", variable=self.startup))
+        add("Shortcuts", ttk.Checkbutton(f, text="Start WinPilot in the tray when Windows starts",
+                                         variable=self.startup))
         add("", ttk.Button(f, text="Create desktop shortcut", command=self._desktop_shortcut))
 
-        btns = ttk.Frame(f)
-        btns.grid(row=row, column=0, columnspan=2, sticky="e", pady=(16, 0))
-        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
-        ttk.Button(btns, text="Save", style="Accent.TButton", command=self._save).pack(side="right", padx=8)
+        bottom = ttk.Frame(outer)
+        bottom.pack(fill="x", pady=(12, 0))
+        ttk.Button(bottom, text="Test connection", command=self._test).pack(side="left")
+        self.test_result = ttk.Label(bottom, wraplength=300, justify="left")
+        self.test_result.pack(side="left", padx=10)
+        ttk.Button(bottom, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(bottom, text="Save", style="Accent.TButton", command=self._save).pack(side="right", padx=8)
         self.grab_set()
 
     def _collect(self):
         cfg = {k: v.get() for k, v in self.vars.items()}
         cfg["backend"] = "claude" if self.backend.get() == "Claude API" else "lemonade"
+        cfg["local_style"] = next(k for k, v in LOCAL_STYLES.items() if v == self.style.get())
         cfg["max_steps"] = max(1, int(cfg["max_steps"]))
+        cfg["keep_logs_days"] = max(1, int(cfg["keep_logs_days"]))
         return {k: v.strip() if isinstance(v, str) else v for k, v in cfg.items()}
 
     def _refresh_models(self):
@@ -1115,6 +1363,21 @@ class SettingsDialog(tk.Toplevel):
                 msg, color = friendly_error(e), self.app.pal["error"]
             self.app.events.put(("call", lambda: self.winfo_exists() and self.test_result.configure(
                 text=msg, foreground=color)))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _clean_now(self):
+        try:
+            days = max(1, int(self.vars["keep_logs_days"].get()))
+        except ValueError:
+            return
+        self.clean_result.configure(text="Cleaning...")
+
+        def run():
+            try:
+                text = "\n".join(housekeeping.clean(days))
+            except Exception as e:
+                text = f"Cleanup failed: {e}"
+            self.app.events.put(("call", lambda: self.winfo_exists() and self.clean_result.configure(text=text)))
         threading.Thread(target=run, daemon=True).start()
 
     def _desktop_shortcut(self):

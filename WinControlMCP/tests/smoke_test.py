@@ -66,6 +66,41 @@ async def run():
     right = 2 * int(slider[1]) - int(thumb[1])
     await call("drag", from_x=int(thumb[1]), from_y=int(thumb[2]), to_x=right, to_y=int(thumb[2]))
 
+    # Waiting, reading, clipboard and window placement.
+    found, _ = await call("wait_for", window=TITLE, text="clicks: 3", timeout_ms=5000)
+    assert "clicks: 3" in found, found
+    try:
+        await call("wait_for", window="NoSuchWindow-xyz", timeout_ms=600)
+        raise AssertionError("wait_for did not time out")
+    except AssertionError:
+        raise
+    except Exception as e:
+        assert "Timed out" in str(e), e
+    page, _ = await call("read_page_text", window=TITLE)
+    assert "clicks: 3" in page and "Press me" in page, page
+    saved, _ = await call("clipboard", action="get")
+    await call("clipboard", action="set", text="winpilot clipboard test")
+    got, _ = await call("clipboard", action="get")
+    assert got.endswith("winpilot clipboard test"), got
+    if saved.startswith("Clipboard text"):  # put the user's clipboard back
+        await call("clipboard", action="set", text=saved.split(":\n", 1)[1])
+    await call("arrange_window", window=TITLE, action="move", x=340, y=320)
+    r = server.wt.RECT()
+    server.cb.user32.GetWindowRect(server._resolve(TITLE), server.ctypes.byref(r))
+    assert (r.left, r.top) == (340, 320), (r.left, r.top)
+
+    import omniparser
+    if omniparser.available():  # optional vision detector (setup_omniparser.cmd)
+        found, result = await call("detect_elements", window=TITLE)
+        assert [c.type for c in result.content] == ["text", "image"], result.content
+        moved, _ = await call("get_ui_elements", window=TITLE, filter="Press me")  # the window was moved above
+        bx, by = map(int, re.search(r"at \((\d+), (\d+)\)", moved).groups())
+        left, top = server.cb.client_to_screen(server._resolve(TITLE), 0, 0)
+        points = [(int(m[1]), int(m[2])) for m in re.finditer(r"click\(x=(\d+), y=(\d+)", found)]
+        assert any(abs(left + x - bx) < 25 and abs(top + y - by) < 15 for x, y in points), (found, bx, by)
+    else:
+        print("(OmniParser not installed: skipping detect_elements)")
+
     _, shot = await call("screenshot", window=TITLE)
     assert [c.type for c in shot.content] == ["text", "image"], shot.content
     await call("wait", ms=800)

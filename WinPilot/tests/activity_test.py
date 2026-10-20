@@ -52,6 +52,14 @@ def main():
         assert "secret" not in written.lower() and len(written.splitlines()) == 5, written
         assert json.loads(written.splitlines()[0])["detail"] == "typed 9 characters"
         print(activity.format_entry(log.query()[0]))
+
+    # Takeover: a real mouse sweep stops the agent; jitter, slow drift and repeats don't.
+    t = activity.TakeoverDetector(distance=80, window=0.4, cooldown=2.0)
+    assert not any(t.feed(500 + i % 3, 500, 1.0 + i * 0.01) for i in range(30))  # jitter
+    assert not any(t.feed(500 + i * 10, 500, 2.0 + i * 0.5) for i in range(10))  # slow drift
+    assert any(t.feed(500 + i * 15, 500, 10.0 + i * 0.02) for i in range(10))    # quick sweep
+    assert not any(t.feed(800 + i * 15, 500, 10.5 + i * 0.02) for i in range(10))  # cooldown
+    assert any(t.feed(500 + i * 15, 500, 13.0 + i * 0.02) for i in range(10))    # after cooldown
     print("PASS")
 
 

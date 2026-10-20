@@ -92,6 +92,7 @@ _sig(user32.WindowFromPoint, wt.HWND, wt.POINT)
 _sig(user32.GetAncestor, wt.HWND, wt.HWND, wt.UINT)
 _sig(user32.GetWindowThreadProcessId, wt.DWORD, wt.HWND, ctypes.POINTER(wt.DWORD))
 _sig(user32.MapVirtualKeyW, wt.UINT, wt.UINT, wt.UINT)
+_sig(user32.VkKeyScanW, ctypes.c_short, wt.WCHAR)
 _sig(user32.SetWindowsHookExW, wt.HANDLE, ctypes.c_int, HOOKPROC, wt.HINSTANCE, wt.DWORD)
 _sig(user32.CallNextHookEx, LRESULT, wt.HANDLE, ctypes.c_int, wt.WPARAM, wt.LPARAM)
 _sig(user32.UnhookWindowsHookEx, wt.BOOL, wt.HANDLE)
@@ -191,7 +192,18 @@ class InputBlocked(RuntimeError):
     pass
 
 
+LAST_INJECTED = 0.0  # time.monotonic() of our latest synthetic input, so watchers can tell it from the user's
+
+
+def _set_cursor(x, y):
+    global LAST_INJECTED
+    LAST_INJECTED = time.monotonic()
+    user32.SetCursorPos(x, y)
+
+
 def _send(*inputs):
+    global LAST_INJECTED
+    LAST_INJECTED = time.monotonic()
     arr = (INPUT * len(inputs))(*inputs)
     ctypes.set_last_error(0)
     sent = user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
@@ -216,7 +228,7 @@ BUTTON_FLAGS = {"left": (0x02, 0x04), "right": (0x08, 0x10), "middle": (0x20, 0x
 def click(pos, button="left", clicks=1):
     """Click at screen pos (x, y), or wherever the cursor is when pos is None."""
     if pos:
-        user32.SetCursorPos(*pos)
+        _set_cursor(*pos)
         time.sleep(0.02)  # let the app register the hover before the press
     down, up = BUTTON_FLAGS[button]
     for n in range(clicks):
@@ -227,14 +239,14 @@ def click(pos, button="left", clicks=1):
 
 def scroll(pos, notches):
     if pos:
-        user32.SetCursorPos(*pos)
+        _set_cursor(*pos)
         time.sleep(0.02)
     _send(_mouse(0x0800, notches * 120))
 
 
 def move_to(pos):
     """Move the pointer to screen pos (x, y) without clicking, so the app sees a hover."""
-    user32.SetCursorPos(*pos)
+    _set_cursor(*pos)
     _send(_mouse(0x0001))  # a zero-distance relative move makes apps process WM_MOUSEMOVE
     time.sleep(0.02)
 
@@ -247,7 +259,7 @@ def drag(start, end, button="left", steps=12):
     try:
         for i in range(1, steps + 1):
             time.sleep(0.02)
-            user32.SetCursorPos(round(start[0] + (end[0] - start[0]) * i / steps),
+            _set_cursor(round(start[0] + (end[0] - start[0]) * i / steps),
                                 round(start[1] + (end[1] - start[1]) * i / steps))
             _send(_mouse(0x0001))
         time.sleep(0.05)
@@ -273,16 +285,54 @@ def _key(vk, up=False):
     return event
 
 
+def _vk_for(name):
+    if name in VK:
+        return [VK[name]]
+    if len(name) == 1:  # punctuation such as / . , - = [ ] on the current keyboard layout
+        code = user32.VkKeyScanW(name)
+        if code != -1:
+            return ([VK["shift"]] if code & 0x100 else []) + [code & 0xFF]
+    raise ValueError(f"unknown key '{name}' (examples: enter, ctrl+s, alt+f4)")
+
+
 def parse_combo(combo):
-    names = [p.strip().lower() for p in combo.split("+")]
-    if not combo.strip() or any(n not in VK for n in names):
-        raise ValueError(f"unknown key in '{combo}' (examples: enter, ctrl+s, alt+f4)")
-    return [VK[n] for n in names]
+    names = [p.strip().lower() for p in combo.replace("++", "+plus").split("+")]
+    if not combo.strip():
+        raise ValueError("empty key combo (examples: enter, ctrl+s, alt+f4)")
+    vks = []
+    for name in names:
+        vks += [v for v in _vk_for("+" if name == "plus" else name) if v not in vks]
+    return vks
 
 
 def press_combo(combo):
     vks = parse_combo(combo)
     _send(*[_key(v) for v in vks], *[_key(v, up=True) for v in reversed(vks)])
+
+
+def keys_down(combo):
+    """Press and hold a combo (released by keys_up); returns what to release."""
+    vks = parse_combo(combo) if combo else []
+    if vks:
+        _send(*[_key(v) for v in vks])
+    return vks
+
+
+def keys_up(vks):
+    if vks:
+        _send(*[_key(v, up=True) for v in reversed(vks)])
+
+
+def mouse_button(button, down):
+    _send(_mouse(BUTTON_FLAGS[button][0 if down else 1]))
+
+
+def hscroll(pos, notches):
+    """Horizontal wheel: positive scrolls right."""
+    if pos:
+        _set_cursor(*pos)
+        time.sleep(0.02)
+    _send(_mouse(0x1000, notches * 120))
 
 
 def type_text(text, delay=0.01):

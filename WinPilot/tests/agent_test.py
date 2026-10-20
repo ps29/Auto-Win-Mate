@@ -2,7 +2,8 @@
 
 Drives WinControlMCP's throwaway test window (tests/testwin.ps1) through the real tools,
 and checks the approval flow (allow, deny, "allow all for this task"), the activity log the
-agent writes and reads, and the activity summary added to the next task.
+agent writes and reads, the activity summary added to the next task, and a batch of Claude
+computer-toolset actions that stops at the first failure.
 WINCONTROL_ALLOWED_EXES is locked to powershell.exe, so no other app receives input.
 
 Run from the WinPilot folder:
@@ -22,6 +23,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 import pilot  # noqa: E402
 import activity  # noqa: E402
+import computer  # noqa: E402
 
 SERVER_TESTS = HERE.parent.parent / "WinControlMCP" / "tests"
 STATE = SERVER_TESTS / "teststate.txt"
@@ -35,6 +37,7 @@ class ScriptedBackend:
         assert {t.name for t in tools} >= {"get_ui_elements", "set_text", "click_element", "drag",
                                            "move_mouse", "get_cursor", "read_activity_log"}
         self.results, self.turn, self.prompts = [], 0, []
+        self.screen = computer.Screen(computer.claude_fit)
         ScriptedBackend.instance = self
 
     def mark(self):
@@ -64,7 +67,13 @@ class ScriptedBackend:
         if self.turn in plan:
             name, args = plan[self.turn]
             return "", [(f"c{self.turn}", name, args)], False
-        if self.turn == 7:
+        if self.turn == 7:  # computer toolset batch: a click, a bad action, then one that must not run
+            m = re.search(r'Button "Press me".*? at \((\d+), (\d+)\)', elements)
+            point = list(self.screen.to_model(int(m[1]), int(m[2])))
+            return "", [("t1", "left_click", {"coordinate": point}, "computer"),
+                        ("t2", "teleport", {}, "computer"),
+                        ("t3", "left_click", {"coordinate": point}, "computer")], False
+        if self.turn == 8:
             return "Done.", [], False
         return "Second task done.", [], False
 
@@ -132,7 +141,12 @@ def main():
         assert details[2].startswith('Type "typed by pilot"'), details
         assert details[3].startswith("you denied: Click"), details
         assert details[4:6] == [details[4]] * 2 and details[4].startswith("Click"), details
-        assert details[6] == "finished task", details
+        assert details[6].startswith("Left click at"), details  # the computer toolset click
+        assert details[7] == "finished task", details
+        batch = ScriptedBackend.instance.results[6]
+        assert [r["toolset"] for r in batch] == ["computer"] * 3, batch
+        assert [r["error"] for r in batch] == [False, True, True], batch
+        assert batch[2]["text"] == "Not executed: an earlier computer action in this turn failed.", batch
         log_result = [d for k, d in log if k == "result"][-1]
         assert "agent  you denied: Click" in log_result, log_result
         prompts = ScriptedBackend.instance.prompts
@@ -141,7 +155,7 @@ def main():
         assert "you    pressed ctrl+s" in prompts[1] and prompts[1].endswith("Task: anything else?"), prompts[1]
         assert state["empty"] == "typed by pilot", state
         assert state["filled"] == "existing user text", state
-        assert state["clicks"] == "2", state
+        assert state["clicks"] == "3", state  # two click_element + one computer toolset click
         print("PASS")
     finally:
         window.kill()

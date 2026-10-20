@@ -115,7 +115,31 @@ class KeyAggregator:
             self.log.add("you", "typing", f"typed {self.count} character{'s' if self.count > 1 else ''}", self.hwnd)
             self.count = 0
 
+# ---------------------------------------------------------------- user takeover
+
+
+class TakeoverDetector:
+    """Says when the user grabs the mouse: real (not injected) movement of more than
+    `distance` pixels within `window` seconds. Our own synthetic input is ignored."""
+
+    def __init__(self, distance=80, window=0.4, cooldown=2.0):
+        self.distance, self.window, self.cooldown = distance, window, cooldown
+        self.points, self.fired_at = [], -cooldown
+
+    def feed(self, x, y, t):
+        self.points = [p for p in self.points if t - p[2] <= self.window] + [(x, y, t)]
+        x0, y0, _ = self.points[0]
+        if abs(x - x0) + abs(y - y0) >= self.distance and t - self.fired_at >= self.cooldown:
+            self.points, self.fired_at = [], t
+            return True
+        return False
+
 # ---------------------------------------------------------------- hooks
+
+
+class MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("pt", wt.POINT), ("mouseData", wt.DWORD), ("flags", wt.DWORD), ("time", wt.DWORD),
+                ("dwExtraInfo", cb.ULONG_PTR)]
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -128,6 +152,7 @@ cb._sig(user32.SetWinEventHook, wt.HANDLE, wt.DWORD, wt.DWORD, wt.HMODULE, WINEV
         wt.DWORD)
 cb._sig(user32.UnhookWinEvent, wt.BOOL, wt.HANDLE)
 WH_KEYBOARD_LL, LLKHF_INJECTED = 13, 0x10
+WH_MOUSE_LL, WM_MOUSEMOVE, LLMHF_INJECTED = 14, 0x200, 0x1
 EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT = 0x0003, 0x0000
 KEY_DOWN_MSGS = {0x100, 0x104}  # WM_KEYDOWN, WM_SYSKEYDOWN
 
@@ -139,11 +164,15 @@ class DesktopMonitor:
     `record_input()` is checked live, so your clicks and keys can be switched off without restarting.
     """
 
-    def __init__(self, log, ignore_hwnd, record_input=lambda: True):
+    def __init__(self, log, ignore_hwnd, record_input=lambda: True, watch_takeover=lambda: False,
+                 on_takeover=lambda: None):
         self.log, self.ignore, self.record_input = log, ignore_hwnd, record_input
+        self.watch_takeover, self.on_takeover = watch_takeover, on_takeover
         self.raw = queue.Queue()
         self.keys = KeyAggregator(log)
+        self.takeover = TakeoverDetector()
         self._kb_proc = cb.HOOKPROC(self._on_key)  # keep references so they aren't garbage-collected
+        self._mouse_proc = cb.HOOKPROC(self._on_mouse)
         self._fg_proc = WINEVENTPROC(self._on_foreground)
 
     def start(self):
@@ -153,12 +182,14 @@ class DesktopMonitor:
 
     def _hooks(self):
         kb = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._kb_proc, kernel32.GetModuleHandleW(None), 0)
+        mouse = user32.SetWindowsHookExW(WH_MOUSE_LL, self._mouse_proc, kernel32.GetModuleHandleW(None), 0)
         fg = user32.SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, self._fg_proc,
                                     0, 0, WINEVENT_OUTOFCONTEXT)
         msg = wt.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             pass
         user32.UnhookWindowsHookEx(kb)
+        user32.UnhookWindowsHookEx(mouse)
         user32.UnhookWinEvent(fg)
 
     def _on_key(self, code, wparam, lparam):
@@ -166,6 +197,17 @@ class DesktopMonitor:
             info = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
             if not info.flags & LLKHF_INJECTED and info.dwExtraInfo != cb.MAGIC:
                 self.raw.put(("key", info.vkCode, wparam in KEY_DOWN_MSGS, time.monotonic()))
+        return user32.CallNextHookEx(None, code, wparam, lparam)
+
+    def _on_mouse(self, code, wparam, lparam):
+        # Runs for every mouse move on the system: bail out as early as possible.
+        if code == 0 and wparam == WM_MOUSEMOVE and self.watch_takeover():
+            info = ctypes.cast(lparam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+            now = time.monotonic()
+            if (not info.flags & LLMHF_INJECTED and info.dwExtraInfo != cb.MAGIC
+                    and now - cb.LAST_INJECTED > 0.5
+                    and self.takeover.feed(info.pt.x, info.pt.y, now)):
+                self.raw.put(("takeover",))
         return user32.CallNextHookEx(None, code, wparam, lparam)
 
     def _on_foreground(self, hook, event, hwnd, id_object, id_child, thread, ms):
@@ -194,6 +236,9 @@ class DesktopMonitor:
                     else:
                         self.keys.flush()
                         self.log.add("you", "click", f"{kind}-clicked at ({x}, {y})", hwnd)
+                elif item and item[0] == "takeover":
+                    self.log.add("you", "takeover", "took over the mouse")
+                    self.on_takeover()
                 elif item and item[0] == "fg":
                     hwnd = cb.root_of(item[1])
                     if hwnd and hwnd != last_fg and hwnd != self.ignore and cb.window_title(hwnd):

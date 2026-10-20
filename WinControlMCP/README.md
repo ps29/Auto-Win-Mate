@@ -15,13 +15,26 @@ For other MCP clients, configure a stdio server that runs `.venv\Scripts\python.
 | `list_windows` | Open windows: hwnd, title, exe |
 | `focus_window` | Bring a window to the front (by hwnd, title, or exe name) |
 | `start_app` | Launch `notepad`, `calc`, `ms-settings:`, a path, a URL... |
-| `get_ui_elements` | A window's buttons, fields, menus... as numbered ids |
+| `get_ui_elements` | A window's buttons, fields, menus... as numbered ids (`web_only=True`: just the page inside a browser) |
+| `read_page_text` | The text of a web page, document or window |
+| `wait_for` | Wait until a window or a piece of text appears (instead of guessing with `wait`) |
 | `click_element` / `set_text` | Click an element, or fill a field |
 | `click` / `type_text` / `press_keys` / `scroll` | Raw mouse and keyboard input |
 | `move_mouse` / `drag` | Hover without clicking; drag-and-drop, sliders, selecting |
 | `get_cursor` | Where the mouse pointer, the keyboard focus and the text cursor (caret) are |
+| `clipboard` | Read or set the clipboard's text |
+| `arrange_window` | Maximize, minimize, restore, move or resize a window |
+| `detect_elements` | Optional: find clickable regions by vision (OmniParser) in apps with no UI elements |
 | `screenshot` | Image of the desktop or a window, with how to map pixels to `click` |
 | `wait` | Pause while the UI updates |
+
+## Vision element detection (optional)
+`detect_elements` uses [OmniParser V2](https://huggingface.co/microsoft/OmniParser-v2.0)'s `icon_detect_v3`
+detector (MIT license) to find buttons and icons in apps that expose no UI Automation elements: games,
+custom-drawn apps, remote desktops. It returns a screenshot with numbered boxes and the click point of each.
+```bat
+setup_omniparser.cmd   :: installs CPU torch and downloads the weights to omniparser\ (about 1 GB in total)
+```
 
 ## Local models (Lemonade Server)
 `local-agent.cmd` runs an MCP-capable agent CLI against a local model served by [Lemonade](https://lemonade-server.ai). The default model is `Qwen3-VL-8B-Instruct-GGUF`; override it with the `MODEL` environment variable.
@@ -42,7 +55,7 @@ An 8B model handles short, specific tasks well (filling a field and clicking a b
 - **Protected text:** `set_text` refuses to overwrite existing text unless the call passes `replace_existing=True`.
 - **Blocked input:** if Windows blocks simulated input (UIPI, i.e. an elevated or system process is in the foreground), the tools return an error instead of a false success.
 - **Stuck focus:** when a hidden service window (e.g. GameInputSvc) holds the foreground, window activation falls back to minimize-and-restore.
-- **Log:** every action is appended to `actions.log`.
+- **Log:** every action is appended to `actions.log`, which rotates at 5 MB (3 old copies kept). Set `WINCONTROL_LOG` to move it. The packaged `WinControlMCP.exe` writes it to `%LOCALAPPDATA%\WinPilot`.
 
 ## Testing
 ```bat
