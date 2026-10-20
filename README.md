@@ -40,6 +40,7 @@ Features:
 - Playback can pause automatically while the target window isn't in front.
 - Repeat count, speed and random offset/delay are adjustable.
 - A quick-clicker mode clicks at a fixed interval.
+- Optional human-like mode: curved mouse movement and typing at a person's pace.
 - Scripts save and load as JSON.
 
 ## WinControlMCP

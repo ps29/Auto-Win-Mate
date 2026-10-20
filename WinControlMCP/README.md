@@ -49,6 +49,13 @@ Small models need three settings, which the script handles except for the first:
 
 An 8B model handles short, specific tasks well (filling a field and clicking a button takes about 30 s). It's much less reliable on long multi-step tasks.
 
+## Input speed
+By default, input looks human: the mouse moves along a slightly curved path that speeds up and slows down
+(longer moves take longer, as with a real hand), clicks are aimed and held briefly, keys in a combo go down one
+after another, and typing runs at about 7-12 characters per second with natural pauses. If you move the mouse
+while the agent is moving it, the movement stops. Set `WINCONTROL_INPUT_SPEED=careful` for slower input, or
+`instant` for the old fastest behavior.
+
 ## Safety
 - **Failsafe:** with the mouse in the top-left screen corner, every input tool refuses to act.
 - **Allowlist:** `WINCONTROL_ALLOWED_EXES=notepad.exe,calculatorapp.exe` restricts which apps receive input.

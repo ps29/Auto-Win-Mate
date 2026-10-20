@@ -77,7 +77,9 @@ DEFAULTS = {
     "local_style": "tools",                   # "tools" (tool calling), "fara" (Fara-7B) or "uitars" (UI-TARS-1.5)
     "takeover": True,                         # moving the mouse yourself stops the running task
     "keep_logs_days": 30,                     # delete daily activity logs older than this
+    "input_speed": "human",                   # "human", "careful" or "instant"
 }
+INPUT_SPEEDS = {"human": "Human-like", "careful": "Human-like, slower", "instant": "Instant (fastest)"}
 LOCAL_STYLES = {"tools": "Tool calling (Qwen3-VL and similar)", "fara": "Fara-7B (screenshots only)",
                 "uitars": "UI-TARS-1.5 (screenshots only)"}
 CLAUDE_MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
@@ -818,6 +820,7 @@ class App:
             pystray.MenuItem("Quit", lambda: self.events.put(("tray", "quit")))))
         self.tray.run_detached()
 
+        cb.set_input_speed(self.cfg["input_speed"])
         self.log.add("system", "app", "WinPilot started")
         self._housekeeping()
         self._update_backend_label()
@@ -1202,6 +1205,7 @@ class App:
 
     def apply_settings(self, cfg):
         self.cfg = cfg
+        cb.set_input_speed(cfg["input_speed"])
         save_settings(cfg)
         self._update_backend_label()
 
@@ -1289,6 +1293,11 @@ class SettingsDialog(tk.Toplevel):
 
         section("Safety and privacy")
         add("Max steps per task", ttk.Spinbox(f, from_=5, to=200, textvariable=self.vars["max_steps"], width=8))
+        self.speed = tk.StringVar(value=INPUT_SPEEDS.get(c.get("input_speed", "human"), INPUT_SPEEDS["human"]))
+        add("Input speed", ttk.Combobox(f, textvariable=self.speed, state="readonly", width=24,
+                                        values=list(INPUT_SPEEDS.values())),
+            "Human-like moves the mouse along curved paths and types at a person's pace, with natural pauses. "
+            "Moving the mouse yourself mid-movement stops it.")
         add("", ttk.Checkbutton(f, text="Ask before clicking, typing, dragging or launching apps",
                                 variable=self.vars["ask_before_input"]))
         add("", ttk.Checkbutton(f, text="Hide this window while the agent acts",
@@ -1338,6 +1347,7 @@ class SettingsDialog(tk.Toplevel):
         cfg = {k: v.get() for k, v in self.vars.items()}
         cfg["backend"] = "claude" if self.backend.get() == "Claude API" else "lemonade"
         cfg["local_style"] = next(k for k, v in LOCAL_STYLES.items() if v == self.style.get())
+        cfg["input_speed"] = next(k for k, v in INPUT_SPEEDS.items() if v == self.speed.get())
         cfg["max_steps"] = max(1, int(cfg["max_steps"]))
         cfg["keep_logs_days"] = max(1, int(cfg["keep_logs_days"]))
         return {k: v.strip() if isinstance(v, str) else v for k, v in cfg.items()}

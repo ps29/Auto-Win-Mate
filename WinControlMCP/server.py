@@ -35,6 +35,9 @@ FROZEN = getattr(sys, "frozen", False)  # packaged as WinControlMCP.exe / inside
 LOG = Path(os.environ.get("WINCONTROL_LOG", Path(os.environ.get("LOCALAPPDATA", HERE)) / "WinPilot" / "actions.log"
                           if FROZEN else HERE / "actions.log"))
 LOG_MAX_BYTES, LOG_KEEP = 5 * 1024 * 1024, 3  # actions.log rotates to actions.log.1 .. .3
+# How fast simulated input is: "human" (default: curved mouse paths, typing at a person's pace),
+# "careful" (slower still) or "instant".
+cb.set_input_speed(os.environ.get("WINCONTROL_INPUT_SPEED", "human"))
 ALLOWED = {e.strip().lower() for e in os.environ.get("WINCONTROL_ALLOWED_EXES", "").split(",") if e.strip()}
 INTERACTIVE = {"Button", "Edit", "CheckBox", "ComboBox", "ListItem", "MenuItem", "TabItem",
                "Hyperlink", "RadioButton", "Document", "Slider", "TreeItem", "DataItem",
