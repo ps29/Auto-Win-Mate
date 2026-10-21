@@ -148,10 +148,12 @@ def _client_rect(hwnd):
 
 def _element(element_id):
     if not 0 <= element_id < len(_ELEMENTS):
-        raise ValueError(f"Unknown element id {element_id}. Call get_ui_elements first.")
+        raise ValueError(f"Unknown element id {element_id}. Ids only come from the latest get_ui_elements call: "
+                         "call get_ui_elements on the window first.")
     el, hwnd = _ELEMENTS[element_id]
     if not cb.user32.IsWindow(hwnd):
-        raise ValueError("That element's window has closed. Call list_windows.")
+        raise ValueError("That element's window has closed, so its id is stale. Call get_ui_elements on the window "
+                         "you want (list_windows shows what is open) to get fresh ids.")
     return el, hwnd
 
 
@@ -225,7 +227,13 @@ def start_app(command: str, arguments: str = "") -> str:
     if cb.at_failsafe():
         raise RuntimeError("Failsafe is active (the mouse is in the top-left screen corner).")
     before = {h for h, _, _ in cb.list_windows()}
-    os.startfile(command, arguments=arguments) if arguments else os.startfile(command)
+    # Start in the user's home, not our own folder: a launched app keeps its working directory, which would
+    # otherwise lock WinPilot's install folder (blocking an upgrade or uninstall) for as long as it runs.
+    home = str(Path.home())
+    if arguments:
+        os.startfile(command, arguments=arguments, cwd=home)
+    else:
+        os.startfile(command, cwd=home)
     _log(f"start_app {command!r} {arguments!r}")
     deadline = time.time() + 8
     while time.time() < deadline:
@@ -486,14 +494,33 @@ def click(x: int, y: int, button: Literal["left", "right", "middle"] = "left", c
     if window is not None:
         hwnd = _resolve(window)
         _guard(hwnd)
-        note = _focus(hwnd)
         sx, sy = cb.client_to_screen(hwnd, x, y)
+        _check_point(sx, sy, hwnd, (x, y))
+        note = _focus(hwnd)
     else:
         sx, sy = x, y
+        _check_point(sx, sy)
         _guard(cb.root_of(cb.user32.WindowFromPoint(wt.POINT(x, y))))
     cb.click((sx, sy), button, max(1, min(clicks, 3)))
     _log(f"click ({sx}, {sy}) {button} x{clicks}")
     return f"Clicked {button} x{clicks} at screen ({sx}, {sy}).{note}"
+
+
+def _check_point(sx, sy, hwnd=None, given=None):
+    """Refuse a screen point that can't be clicked. Models sometimes invent coordinates; an off-screen
+    target would be clamped to the screen edge and click the wrong thing."""
+    vx, vy = cb.user32.GetSystemMetrics(76), cb.user32.GetSystemMetrics(77)
+    vw, vh = cb.user32.GetSystemMetrics(78), cb.user32.GetSystemMetrics(79)
+    shown = given or (sx, sy)
+    if not (vx <= sx < vx + vw and vy <= sy < vy + vh):
+        raise ValueError(f"The point {shown} is off the screen ({vw}x{vh}). Take a screenshot and use "
+                         "coordinates inside it.")
+    if hwnd is not None:
+        r = wt.RECT()
+        cb.user32.GetWindowRect(hwnd, ctypes.byref(r))
+        if not (r.left <= sx < r.right and r.top <= sy < r.bottom):
+            raise ValueError(f"The point {shown} is outside that window ({r.right - r.left}x{r.bottom - r.top}). "
+                             "Take screenshot(window=...) and use coordinates inside the image, scaled as it says.")
 
 
 def _screen_point(x, y, window):
@@ -501,7 +528,10 @@ def _screen_point(x, y, window):
     if window is not None:
         hwnd = _resolve(window)
         _guard(hwnd)
-        return cb.client_to_screen(hwnd, x, y), _focus(hwnd)
+        point = cb.client_to_screen(hwnd, x, y)
+        _check_point(*point, hwnd, (x, y))
+        return point, _focus(hwnd)
+    _check_point(x, y)
     _guard(cb.root_of(cb.user32.WindowFromPoint(wt.POINT(x, y))))
     return (x, y), ""
 

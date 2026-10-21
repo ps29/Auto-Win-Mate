@@ -131,6 +131,14 @@ get_ui_elements(web_only=True) inside browsers, clipboard + ctrl+v to enter long
 arrange_window to move or maximize windows. detect_elements (when available) finds clickable \
 regions by vision in apps without UI elements.
 - After each action, check the result (get_ui_elements again, or a screenshot) before moving on.
+- Element ids are valid only until the next get_ui_elements call, and never carry over from an earlier \
+task: call get_ui_elements before click_element / set_text. If a call fails, change something before \
+trying again; never repeat the same call with the same arguments.
+- For websites, put the address or search in the URL instead of clicking in the browser: start_app with \
+https://www.youtube.com/results?search_query=the+simpsons opens that search directly. Then use \
+get_ui_elements(web_only=True) and click_element on a result. Click at x/y only if the element list is empty, \
+and only inside the screenshot you just took.
+- On a results page (search, video list, store), click one result's own link, for example the first video's title, then check that the page changed. Don't click section headings, filters or Reload instead.
 - When the user gives text to type or enter, use it exactly and completely, word for word.
 - If the user wants something done later or on a schedule ("at 11 pm", "every morning at 8", \
 "on Fridays"), don't do it now: call schedule_task with the full task to perform at that time, \
@@ -329,6 +337,9 @@ class Agent(threading.Thread):
         self.decision = "deny"
         self.backend, self.backend_key = None, None
         self.lemonade = None  # lemonade.LemonadeServer, created when a local-model task first needs it
+        self.fail_streak, self.abort_reason = {}, None  # identical failing calls in a row; why to stop the task
+        self.unverified, self.nudges = False, 0  # the last action was input nobody has looked at yet
+        self.done_count = {}  # identical input actions that worked, per task
         self.elements = {}  # element id -> description, from the latest get_ui_elements
         self.allow_all = False
         self.log = app.log
@@ -354,6 +365,10 @@ class Agent(threading.Thread):
         while True:
             text, cfg = self.tasks.get()
             self.stop_flag.clear()
+            server._ELEMENTS.clear()  # ids from earlier tasks point at windows that may be gone
+            self.fail_streak, self.abort_reason = {}, None
+            self.unverified, self.nudges = False, 0
+            self.done_count = {}
             self.calm_until = time.monotonic() + 2.0
             self.allow_all = not cfg["ask_before_input"]
             self.log.add("agent", "task", f'started task: "{text[:120]}"')
@@ -409,9 +424,20 @@ class Agent(threading.Thread):
             if not calls:
                 if more:
                     continue
+                if self.unverified and self.nudges < 2:
+                    # Small models say "done" right after a click. Make them look at the result first.
+                    self.nudges += 1
+                    self.unverified = False
+                    self.emit("info", "Checking the result before finishing...")
+                    b.add_user("Before you finish: your last action was input and you have not looked at what it "
+                               "did. Check now with get_ui_elements, read_page_text or a screenshot, then say "
+                               "whether it worked. If it did not, fix it.")
+                    continue
                 return
             b.add_results(self._run_calls(calls))
-        self.emit("error", f"Stopped after {cfg['max_steps']} steps (the limit is in Settings).")
+            if self.abort_reason:
+                raise RuntimeError(self.abort_reason)
+        raise RuntimeError(f"Stopped after {cfg['max_steps']} steps (the limit is in Settings).")
 
     def _ensure_lemonade(self, cfg):
         """Start Lemonade and load the model if needed. It then stays up (and is restarted if it dies) until WinPilot exits."""
@@ -473,7 +499,34 @@ class Agent(threading.Thread):
                 failed = results[-1]["error"]
             else:
                 results.append(self._run_tool(call_id, name, args))
+            self._note_repeat_failure(results[-1], name, args)
+            if not toolset:  # screen actions come back with a fresh screenshot, so they are looked at already
+                self.unverified = name in NEEDS_APPROVAL and not results[-1]["error"]
         return results
+
+    REPEAT_WARN, REPEAT_STOP, REPEAT_NOTE = 3, 6, 4
+
+    def _note_repeat_failure(self, res, name, args):
+        """A model can retry one failing call forever, even between calls that work. Warn it after a few
+        identical failures, stop after more. A call that later succeeds is forgotten."""
+        key = (name, json.dumps(args, sort_keys=True, default=str))
+        if not res["error"]:
+            self.fail_streak.pop(key, None)
+            if name in NEEDS_APPROVAL:  # a model can also loop on actions that "work" but change nothing
+                n = self.done_count[key] = self.done_count.get(key, 0) + 1
+                if n >= self.REPEAT_NOTE and n % self.REPEAT_NOTE == 0:
+                    res["text"] += (f"\nYou have now done this exact action {n} times. If nothing has changed, it "
+                                    "is not working: try a different element or approach, or tell the user what is "
+                                    "blocking you.")
+            return
+        n = self.fail_streak[key] = self.fail_streak.get(key, 0) + 1
+        if n >= self.REPEAT_STOP:  # _task raises this once the turn's results are in the history
+            self.abort_reason = (f"Stopped: {name} failed {n} times with the same arguments "
+                                 f"({res['text'][:200]}).")
+        if n >= self.REPEAT_WARN:
+            res["text"] += (f"\nThis exact call has now failed {n} times. Do not repeat it: change the "
+                            "approach (for example call get_ui_elements for fresh ids, or take a screenshot), or "
+                            "tell the user what is blocking you.")
 
     def _approve(self, action):
         """Ask the user (unless they allowed everything for this task). True if allowed."""
