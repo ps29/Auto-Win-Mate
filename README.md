@@ -8,7 +8,43 @@ Windows 11 desktop automation, in two parts:
 | [`WinControlMCP/`](WinControlMCP) | An [MCP](https://modelcontextprotocol.io) server that lets AI agents see and control the desktop: list windows, read an app's buttons and fields through UI Automation, click, type, scroll and take screenshots. It works with cloud models and with local models served by [Lemonade Server](https://lemonade-server.ai). |
 | [`WinPilot/`](WinPilot) | A tray app where you tell an AI (a local model via Lemonade, or Claude via the Claude Code CLI) what to do in plain language. It carries the task out with the mouse and keyboard while you watch (move the mouse to stop it), and keeps an activity log of the desktop that the agent can read. Local models include the computer-use models Fara-7B and UI-TARS. |
 
+`AutoWinMate.exe` (from `launcher/`) is a small window with buttons that open WinPilot or ClickBot.
 Both use the Win32 API directly (`SendInput`, window enumeration, low-level hooks). WinControlMCP reuses ClickBot's input code, and WinPilot reuses WinControlMCP's tools.
+
+## How it fits together
+
+```mermaid
+flowchart LR
+    User([You]) -->|"task in plain language"| WP["WinPilot<br/>tray app + agent loop"]
+    WP <-->|"chat + tool calls"| LLM["Local model via Lemonade<br/>or Claude Code CLI"]
+    WP -->|"call_tool (in-process)"| MCP["WinControlMCP<br/>tools + safety checks"]
+    Other["Other MCP clients"] -->|stdio| MCP
+    MCP --> CB["ClickBot library<br/>click, type, scroll, windows"]
+    MCP --> UIA["UI Automation<br/>read buttons and fields"]
+    CB --> Win["Windows 11 (Win32)"]
+    UIA --> Win
+    WP -.->|"starts, loads model, stops"| LLM
+```
+
+The agent loop, in pseudocode:
+
+```text
+ensure the model server is running and the model is loaded
+add the task (plus recent desktop activity) to the chat
+repeat until done, stopped, or out of steps:
+    ask the model for its next step
+    if it asks for no tools:
+        if it acted but never looked at the result: make it check first
+        else: finish
+    for each tool call it asks for:
+        ask you for approval if that is turned on
+        run it through WinControlMCP (failsafe, allowlist and on-screen checks apply)
+        count repeated identical failures: warn at 3, stop at 6
+    give the results back to the model
+```
+
+More diagrams (the full task flowchart, one tool call end to end, the Lemonade lifecycle) and the rest of the
+pseudocode are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Install (no Python needed)
 Build `WinPilot-Setup-<version>.exe` with `packaging\build.cmd` (below) and run it. It installs
@@ -55,8 +91,7 @@ See [WinControlMCP/README.md](WinControlMCP/README.md) for the tool list, safety
 
 ## WinPilot
 ```bat
-WinPilot
-un_pilot.bat
+WinPilot\run_pilot.bat
 ```
 Type a task and watch the feed; move the mouse to stop it. The Activity tab logs what happens on the desktop (agent actions, window switches, your clicks and shortcuts; typed text is only counted, never stored). Ctrl+Alt+Space shows or hides the window. See [WinPilot/README.md](WinPilot/README.md).
 

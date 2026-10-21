@@ -280,6 +280,13 @@ def human_path(start, end, rng=random):
     return points
 
 
+def clamp_to_screen(x, y):
+    """The nearest point on the virtual desktop (SetCursorPos clamps to it, so a path must too)."""
+    left, top = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
+    width, height = user32.GetSystemMetrics(78), user32.GetSystemMetrics(79)
+    return min(max(x, left), left + width - 1), min(max(y, top), top + height - 1)
+
+
 def _glide(pos, pace=1.0):
     """Move the pointer to pos: a jump in instant mode, a hand-like movement otherwise.
     Raises MovedByUser if someone moves the mouse while it glides."""
@@ -290,7 +297,7 @@ def _glide(pos, pace=1.0):
     dist = math.hypot(pos[0] - start[0], pos[1] - start[1])
     # Fitts's law: far targets take longer, but not proportionally longer (about 0.15-0.6 s).
     duration = (0.12 + 0.11 * math.log2(1 + dist / 25)) * _speed["pace"] * pace * random.uniform(0.85, 1.15)
-    path = human_path(start, pos)
+    path = [clamp_to_screen(*p) for p in human_path(start, pos)]
     gap = duration / len(path)
     last = start
     for point in path:
