@@ -40,17 +40,21 @@ Source: "..\README.md"; DestDir: "{app}"; DestName: "README.md"; Flags: ignoreve
 Source: "..\WinPilot\README.md"; DestDir: "{app}"; DestName: "WinPilot-README.md"; Flags: ignoreversion
 
 [Icons]
+Name: "{autoprograms}\Auto-Win-Mate"; Filename: "{app}\AutoWinMate.exe"; Comment: "Open WinPilot or ClickBot"
 Name: "{autoprograms}\WinPilot"; Filename: "{app}\WinPilot.exe"; Comment: "Tell an AI what to do on your desktop"
-Name: "{autodesktop}\WinPilot"; Filename: "{app}\WinPilot.exe"; Tasks: desktopicon
+Name: "{autoprograms}\ClickBot"; Filename: "{app}\ClickBot.exe"; Comment: "Record and replay clicks and keystrokes"
+Name: "{autodesktop}\Auto-Win-Mate"; Filename: "{app}\AutoWinMate.exe"; Tasks: desktopicon
 Name: "{userstartup}\WinPilot"; Filename: "{app}\WinPilot.exe"; Parameters: "--hidden"; Tasks: startup
 
 [Run]
-Filename: "{app}\WinPilot.exe"; Description: "Start WinPilot now"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\AutoWinMate.exe"; Description: "Open Auto-Win-Mate now"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
 ; Stop a running copy so its files can be removed (it lives in the tray, so it may be open).
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM WinPilot.exe"; Flags: runhidden; RunOnceId: "StopWinPilot"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM WinControlMCP.exe"; Flags: runhidden; RunOnceId: "StopServer"
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM ClickBot.exe"; Flags: runhidden; RunOnceId: "StopClickBot"
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM AutoWinMate.exe"; Flags: runhidden; RunOnceId: "StopLauncher"
 
 [Code]
 // Settings, API key and logs live in %APPDATA%\WinPilot and %LOCALAPPDATA%\WinPilot.
