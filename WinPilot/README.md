@@ -37,10 +37,10 @@ The agent sees what happened since its last task at the start of each new task, 
 ## Watching and controlling
 - **Feed:** what the model says, every tool call, and a preview of each result.
 - **Agent's view:** the latest screenshot the model took. Tick **Live view** to see a desktop thumbnail that refreshes every 1.5 s.
-- **Approval:** clicks, typing, key presses, scrolling, dragging and app launches each show an **Allow / Allow all this task / Deny** bar first. Reading windows, hovering, checking the cursor and taking screenshots don't ask. You can turn approval off in Settings.
+- **Approval (optional):** off by default, so the agent just does the task. Turn on **Ask before clicking, typing, dragging or launching apps** in Settings to get an **Allow / Allow all this task / Deny** bar before each input action. Reading windows, hovering and screenshots never ask.
 - **Cursor control:** the agent clicks, hovers (`move_mouse`), drags, scrolls and types. It moves the text cursor with arrow, Home/End and Ctrl+arrow keys, and checks where the pointer, keyboard focus and text cursor are with `get_cursor`. The panel under the agent's view shows the live mouse position.
 - **Human-like input:** by default the agent moves the mouse along curved paths and types at a person's pace. Change it under Settings > Safety and privacy > **Input speed** (Human-like, slower, or Instant).
-- **Take over any time:** move the mouse yourself while a task runs and WinPilot stops it (turn this off in Settings). Moving the mouse to answer an approval doesn't count.
+- **Take over any time:** move the mouse yourself while a task runs and WinPilot stops it (turn this off in Settings). When approvals are on, moving the mouse to answer one doesn't count.
 - **Vision element detection:** after running `..\WinControlMCP\setup_omniparser.cmd` once, the agent can find buttons by vision (OmniParser) in apps without UI elements.
 - WinPilot leaves itself out of screenshots and window lists, and hides while an input action runs, so its own window never gets clicked or typed into.
 
