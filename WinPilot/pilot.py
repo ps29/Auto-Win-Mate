@@ -135,7 +135,7 @@ regions by vision in apps without UI elements.
 task: call get_ui_elements before click_element / set_text. If a call fails, change something before \
 trying again; never repeat the same call with the same arguments.
 - For websites, put the address or search in the URL instead of clicking in the browser: start_app with \
-https://www.youtube.com/results?search_query=the+simpsons opens that search directly. Then use \
+https://www.youtube.com/results?search_query=<the user's words, joined with +> opens that search directly (use what the user asked for now, never an earlier task's words). To type in the address bar yourself, press ctrl+l first: it selects the old address, so your text replaces it. Then use \
 get_ui_elements(web_only=True) and click_element on a result. Click at x/y only if the element list is empty, \
 and only inside the screenshot you just took.
 - On a results page (search, video list, store), click one result's own link, for example the first video's title, then check that the page changed. Don't click section headings, filters or Reload instead.
@@ -339,6 +339,7 @@ class Agent(threading.Thread):
         self.lemonade = None  # lemonade.LemonadeServer, created when a local-model task first needs it
         self.fail_streak, self.abort_reason = {}, None  # identical failing calls in a row; why to stop the task
         self.unverified, self.nudges = False, 0  # the last action was input nobody has looked at yet
+        self.last_outcome = "finished task"
         self.done_count = {}  # identical input actions that worked, per task
         self.elements = {}  # element id -> description, from the latest get_ui_elements
         self.allow_all = False
@@ -369,6 +370,8 @@ class Agent(threading.Thread):
             self.fail_streak, self.abort_reason = {}, None
             self.unverified, self.nudges = False, 0
             self.done_count = {}
+            if self.last_outcome != "finished task":
+                self.backend = None  # a failed or stopped task's history would steer the next one
             self.calm_until = time.monotonic() + 2.0
             self.allow_all = not cfg["ask_before_input"]
             self.log.add("agent", "task", f'started task: "{text[:120]}"')
@@ -382,6 +385,7 @@ class Agent(threading.Thread):
                 if self.stop_flag.is_set():
                     outcome = "task stopped by you"
                 self.log.add("agent", "task", outcome)
+                self.last_outcome = outcome
                 self.seen_id = self.log.last_id
                 self.emit("done")
 

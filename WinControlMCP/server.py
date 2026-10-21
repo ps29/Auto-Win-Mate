@@ -18,6 +18,7 @@ import datetime
 import functools
 import io
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -446,6 +447,9 @@ def click_element(element_id: int, button: Literal["left", "right", "middle"] = 
     x, y = _center(el)
     cb.click((x, y), button, 2 if double else 1)
     name = el.element_info.name
+    if (button == "left" and el.element_info.control_type in ("Edit", "ComboBox")
+            and re.search(r"address|enter url|search with", name or "", re.I)):
+        cb.press_combo("ctrl+a")  # a second click puts the caret mid-URL; typed text would be spliced into it
     _log(f"click_element [{element_id}] {name!r} at ({x}, {y}) {button}{' double' if double else ''}")
     return f"Clicked [{element_id}] {el.element_info.control_type} \"{name}\" at ({x}, {y}).{note}"
 
