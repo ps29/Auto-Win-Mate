@@ -44,6 +44,7 @@ import activity  # noqa: E402
 import cli_bridge  # noqa: E402
 import computer  # noqa: E402
 import housekeeping  # noqa: E402
+import lemonade  # noqa: E402
 import omniparser  # noqa: E402
 import scheduler  # noqa: E402  (WinControlMCP\omniparser.py: optional vision element detection)
 
@@ -327,6 +328,7 @@ class Agent(threading.Thread):
         self.stop_flag, self.decided = threading.Event(), threading.Event()
         self.decision = "deny"
         self.backend, self.backend_key = None, None
+        self.lemonade = None  # lemonade.LemonadeServer, created when a local-model task first needs it
         self.elements = {}  # element id -> description, from the latest get_ui_elements
         self.allow_all = False
         self.log = app.log
@@ -378,6 +380,7 @@ class Agent(threading.Thread):
             make = lambda c, t: VisionLocalBackend(c, t, style)  # noqa: E731
         else:
             key, make = ("lemonade", cfg["lemonade_url"], cfg["lemonade_model"]), LemonadeBackend
+        self._ensure_lemonade(cfg)
         if self.backend is None or key != self.backend_key:
             self.backend, self.backend_key = make(cfg, self.tool_defs), key
         b = self.backend
@@ -389,7 +392,14 @@ class Agent(threading.Thread):
                 return
             self.emit("status", "Thinking...")
             try:
-                reply, calls, more = b.step()
+                try:
+                    reply, calls, more = b.step()
+                except Exception:
+                    if not (self.lemonade and not self.lemonade.alive()):
+                        raise
+                    self.emit("info", "Lemonade stopped responding; restarting it...")
+                    self._ensure_lemonade(cfg)
+                    reply, calls, more = b.step()
             except Exception:
                 if step == 0:  # nothing happened yet: forget the message so the chat stays valid
                     b.rollback(mark)
@@ -402,6 +412,17 @@ class Agent(threading.Thread):
                 return
             b.add_results(self._run_calls(calls))
         self.emit("error", f"Stopped after {cfg['max_steps']} steps (the limit is in Settings).")
+
+    def _ensure_lemonade(self, cfg):
+        """Start Lemonade and load the model if needed. It then stays up (and is restarted if it dies) until WinPilot exits."""
+        url = lemonade_base(cfg["lemonade_url"])
+        if self.lemonade is None or self.lemonade.base != url:
+            if self.lemonade:
+                self.lemonade.stop()
+            self.lemonade = lemonade.LemonadeServer(url)
+            self.lemonade.watch(lambda: self.app.cfg["lemonade_model"])
+        self.emit("status", "Checking Lemonade...")
+        self.lemonade.ensure(cfg["lemonade_model"], lambda text: self.emit("status", text))
 
     def _task_cli(self, text, cfg):
         """Claude Code runs the whole loop itself; its tool calls come back through the gateway into
@@ -1272,6 +1293,8 @@ class App:
 
     def quit(self):
         self.agent.stop()
+        if self.agent.lemonade:
+            self.agent.lemonade.stop()  # only stops a server WinPilot started itself
         self.tray.stop()
         self.root.destroy()
         os._exit(0)

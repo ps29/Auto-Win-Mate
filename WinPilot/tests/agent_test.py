@@ -95,6 +95,7 @@ class StubApp:
 
 def main():
     pilot.LemonadeBackend = ScriptedBackend
+    pilot.Agent._ensure_lemonade = lambda self, cfg: None  # the scripted model needs no Lemonade server
     STATE.unlink(missing_ok=True)
     window = subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
                                "-File", str(SERVER_TESTS / "testwin.ps1")])
