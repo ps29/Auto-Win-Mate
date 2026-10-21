@@ -44,7 +44,8 @@ import activity  # noqa: E402
 import cli_bridge  # noqa: E402
 import computer  # noqa: E402
 import housekeeping  # noqa: E402
-import omniparser  # noqa: E402  (WinControlMCP\omniparser.py: optional vision element detection)
+import omniparser  # noqa: E402
+import scheduler  # noqa: E402  (WinControlMCP\omniparser.py: optional vision element detection)
 
 import mss  # noqa: E402
 import pystray  # noqa: E402
@@ -130,6 +131,9 @@ arrange_window to move or maximize windows. detect_elements (when available) fin
 regions by vision in apps without UI elements.
 - After each action, check the result (get_ui_elements again, or a screenshot) before moving on.
 - When the user gives text to type or enter, use it exactly and completely, word for word.
+- If the user wants something done later or on a schedule ("at 11 pm", "every morning at 8", \
+"on Fridays"), don't do it now: call schedule_task with the full task to perform at that time, \
+then confirm when it will run. list_scheduled_tasks and cancel_scheduled_task manage them.
 - The user may have to approve input actions. If one is denied, don't retry it: adjust the plan or ask.
 - If the request is ambiguous, or would delete, overwrite, send, buy or close something the user may \
 care about, stop and ask first.
@@ -274,6 +278,25 @@ NEEDS_APPROVAL = {"click_element", "set_text", "click", "type_text", "press_keys
                   "clipboard"}
 MOVES_FOCUS = NEEDS_APPROVAL | {"focus_window", "move_mouse", "get_cursor"}  # WinPilot hides while these run
 TARGET_FOCUS = {"type_text", "press_keys", "get_cursor"}  # need the user's window in front, not WinPilot
+SCHEDULE_TOOLS = [
+    types.SimpleNamespace(
+        name="schedule_task",
+        description="Schedule a task for WinPilot to do later, once or on a repeat. `prompt` is the complete "
+                    "instruction to carry out at that time, e.g. 'Open Firefox and go to https://example.com'.",
+        input_schema={"type": "object", "required": ["prompt", "time"], "properties": {
+            "prompt": {"type": "string", "description": "What to do at that time, as a full instruction."},
+            "time": {"type": "string", "description": "Local time, e.g. '23:00' or '11 pm'."},
+            "repeat": {"type": "string", "enum": list(scheduler.REPEATS), "default": "once"},
+            "date": {"type": "string", "description": "For repeat='once': YYYY-MM-DD. Blank: the next time "
+                                                      "that clock time comes (today or tomorrow)."},
+            "days": {"type": "string", "description": "For repeat='weekly': days such as 'mon,wed,fri'."}}}),
+    types.SimpleNamespace(
+        name="list_scheduled_tasks", description="List the scheduled tasks with their ids and next run times.",
+        input_schema={"type": "object", "properties": {}}),
+    types.SimpleNamespace(
+        name="cancel_scheduled_task", description="Delete a scheduled task by the id from list_scheduled_tasks.",
+        input_schema={"type": "object", "required": ["task_id"], "properties": {"task_id": {"type": "string"}}}),
+]
 LOG_TOOL = types.SimpleNamespace(
     name="read_activity_log",
     description="Read the desktop activity log: what the user, you (the agent) and Windows did recently "
@@ -324,7 +347,7 @@ class Agent(threading.Thread):
 
     def run(self):
         self.tool_defs = [t for t in asyncio.run(server.mcp.list_tools())
-                          if t.name != "detect_elements" or omniparser.available()] + [LOG_TOOL]
+                          if t.name != "detect_elements" or omniparser.available()] + [LOG_TOOL] + SCHEDULE_TOOLS
         self.gateway = None  # WinPilot's tools served to Claude Code, started on first use
         while True:
             text, cfg = self.tasks.get()
@@ -506,6 +529,14 @@ class Agent(threading.Thread):
             text = "\n".join(activity.format_entry(e) for e in self.log.query(last, source)) or "The log is empty."
             self.emit("result", text)
             return result(text)
+        if name in {t.name for t in SCHEDULE_TOOLS}:
+            try:
+                text = self._schedule_tool(name, args)
+            except (KeyError, ValueError) as e:
+                self.emit("tool_error", str(e).strip("'\""))
+                return result(str(e).strip("'\""), error=True)
+            self.emit("result", text)
+            return result(text)
         action = self._describe(name, args)
         if args.get("window") not in (None, ""):
             try:
@@ -540,6 +571,25 @@ class Agent(threading.Thread):
         for _, data in images:
             self.emit("image", data)
         return result(text, images, bool(r.is_error))
+
+    def _schedule_tool(self, name, args):
+        schedule = self.app.schedule
+        if name == "schedule_task":
+            entry = schedule.add(args.get("prompt"), args.get("time"), args.get("repeat") or "once",
+                                 args.get("date") or "", args.get("days") or "")
+            self.log.add("agent", "schedule", f'scheduled "{entry["prompt"][:80]}" ({scheduler.describe(entry)})')
+            self.emit("schedule_changed")
+            when = schedule.next_time(entry)
+            return (f"Scheduled (id {entry['id']}): {scheduler.describe(entry)}. "
+                    f"Next run: {when:%a %Y-%m-%d %H:%M}." if when else f"Scheduled (id {entry['id']}).")
+        if name == "cancel_scheduled_task":
+            entry = schedule.remove(str(args.get("task_id", "")).strip())
+            self.log.add("agent", "schedule", f'cancelled scheduled task "{entry["prompt"][:80]}"')
+            self.emit("schedule_changed")
+            return f"Cancelled: {entry['prompt']}"
+        lines = [f"{e['id']}: {scheduler.describe(e)}{'' if e.get('enabled') else ' (off)'} - {e['prompt']}"
+                 for e in schedule.entries]
+        return "\n".join(lines) or "No scheduled tasks."
 
     def _describe(self, name, a):
         """One line telling the user what an input action is about to do."""
@@ -623,11 +673,16 @@ class LiveView(threading.Thread):
         self.app = app
 
     def run(self):
+        last = None
         with mss.mss() as s:
             while True:
                 time.sleep(1.5)
                 if self.app.live_on and user32.IsWindowVisible(self.app.hwnd) and time.time() > self.app.hold_until:
                     shot = s.grab(s.monitors[0])
+                    digest = hash(shot.raw)
+                    if digest == last:  # nothing on screen changed: skip the resize and the redraw
+                        continue
+                    last = digest
                     img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
                     img.thumbnail((960, 960))
                     self.app.events.put(("live", img))
@@ -697,6 +752,8 @@ class App:
         self.running, self.live_on, self.hold_until = False, False, 0.0
         self.last_external, self._photo = 0, None
         self.log = activity.ActivityLog(CONFIG.parent / "logs")
+        self.schedule = scheduler.Schedule(CONFIG.parent / "schedule.json")
+        self.pending = []  # scheduled prompts waiting for the agent to be free
         self.log.listeners.append(lambda entry: self.events.put(("activity", entry)))
         self.theme = system_theme()
         self.pal = PALETTES[self.theme]
@@ -736,6 +793,7 @@ class App:
 
         cb.set_input_speed(self.cfg["input_speed"])
         self.log.add("system", "app", "WinPilot started")
+        scheduler.Scheduler(self.schedule, lambda e, status: self.events.put(("scheduled", (e, status)))).start()
         self._housekeeping()
         self._update_backend_label()
         self._pump()
@@ -809,6 +867,7 @@ class App:
         panes.add(self.tabs, weight=3)
         self._build_chat_tab()
         self._build_activity_tab()
+        self._build_schedule_tab()
 
         view = ttk.Frame(panes, padding=(8, 0, 0, 0))
         self.view_caption = ttk.Label(view, text="Agent's view", foreground=pal["muted"])
@@ -886,6 +945,71 @@ class App:
         sb.pack(side="right", fill="y")
         self.activity.pack(side="left", fill="both", expand=True)
         self.tabs.add(frame, text="  Activity  ")
+
+    def _build_schedule_tab(self):
+        frame = ttk.Frame(self.tabs, padding=(0, 6, 0, 0))
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x", pady=(0, 6))
+        ttk.Button(bar, text="Add", style="Accent.TButton", command=lambda: ScheduleDialog(self)).pack(side="left")
+        for text, command in (("Edit", self._edit_scheduled), ("Run now", self._run_now),
+                              ("On / Off", self._toggle_scheduled), ("Delete", self._delete_scheduled)):
+            ttk.Button(bar, text=text, command=command).pack(side="left", padx=(6, 0))
+        ttk.Label(bar, text="Tasks run while WinPilot is open or in the tray.", foreground=self.pal["muted"]
+                  ).pack(side="right")
+        table = ttk.Frame(frame)
+        table.pack(fill="both", expand=True)
+        self.sched = ttk.Treeview(table, columns=("when", "next", "task"), show="headings", selectmode="browse")
+        for col, title, width, stretch in (("when", "When", 190, False), ("next", "Next run", 130, False),
+                                           ("task", "Task", 360, True)):
+            self.sched.heading(col, text=title, anchor="w")
+            self.sched.column(col, width=width, stretch=stretch, anchor="w")
+        self.sched.tag_configure("off", foreground=self.pal["muted"])
+        self.sched.bind("<Double-1>", lambda e: self._edit_scheduled())
+        sb = ttk.Scrollbar(table, command=self.sched.yview)
+        self.sched.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.sched.pack(side="left", fill="both", expand=True)
+        self.tabs.add(frame, text="  Schedule  ")
+        self._reload_schedule()
+
+    def _reload_schedule(self):
+        selected = self.sched.selection()
+        self.sched.delete(*self.sched.get_children())
+        for e in sorted(self.schedule.entries, key=lambda e: (not e.get("enabled"), e["time"])):
+            when = self.schedule.next_time(e)
+            self.sched.insert("", "end", iid=e["id"], tags=() if e.get("enabled") else ("off",),
+                              values=(scheduler.describe(e), f"{when:%a %d %b %H:%M}" if when else "off",
+                                      e["prompt"]))
+        if selected and self.sched.exists(selected[0]):
+            self.sched.selection_set(selected[0])
+
+    def _selected_scheduled(self):
+        sel = self.sched.selection()
+        return self.schedule.get(sel[0]) if sel else None
+
+    def _edit_scheduled(self):
+        entry = self._selected_scheduled()
+        if entry:
+            ScheduleDialog(self, entry)
+
+    def _run_now(self):
+        entry = self._selected_scheduled()
+        if entry:
+            self.tabs.select(0)
+            self._run_scheduled(entry, "run")
+
+    def _toggle_scheduled(self):
+        entry = self._selected_scheduled()
+        if entry:
+            self.schedule.set_enabled(entry["id"], not entry.get("enabled"))
+            self._reload_schedule()
+
+    def _delete_scheduled(self):
+        entry = self._selected_scheduled()
+        if entry and messagebox.askyesno("WinPilot", f"Delete this scheduled task?\n\n{entry['prompt']}",
+                                         parent=self.root):
+            self.schedule.remove(entry["id"])
+            self._reload_schedule()
 
     def _welcome(self):
         self._write("info", "Tell me what to do on your desktop, and I'll do it with the mouse and keyboard. "
@@ -989,11 +1113,28 @@ class App:
         if not text or self.running:
             return
         self.input.delete("1.0", "end")
-        self.examples.pack_forget()
         self.tabs.select(0)
-        self._write("user", f"You: {text}")
+        self._start_task(text, f"You: {text}")
+
+    def _start_task(self, text, heading):
+        self.examples.pack_forget()
+        self._write("user", heading)
         self._set_running(True)
         self.agent.tasks.put((text, dict(self.cfg)))
+
+    def _run_scheduled(self, entry, status):
+        if status == "missed":
+            self.log.add("system", "schedule", f'missed scheduled task "{entry["prompt"][:80]}" '
+                                               "(WinPilot wasn't running or the PC was asleep)")
+            self._write("info", f"Missed a scheduled task ({scheduler.describe(entry)}): {entry['prompt']}")
+        elif self.running:
+            self.pending.append(entry)
+            self._write("info", f"Scheduled task queued until the current one finishes: {entry['prompt']}")
+        else:
+            self.log.add("system", "schedule", f'started scheduled task "{entry["prompt"][:80]}"')
+            self._notify(f"Running scheduled task: {entry['prompt']}", force=True)
+            self._start_task(entry["prompt"], f"Scheduled ({scheduler.describe(entry)}): {entry['prompt']}")
+        self._reload_schedule()
 
     def _set_running(self, running):
         self.running = running
@@ -1042,8 +1183,8 @@ class App:
         self._photo = ImageTk.PhotoImage(img)
         self.view.configure(image=self._photo, text="")
 
-    def _notify(self, text):
-        if not user32.IsWindowVisible(self.hwnd):
+    def _notify(self, text, force=False):
+        if force or not user32.IsWindowVisible(self.hwnd):
             try:
                 self.tray.notify(text[:250], "WinPilot")
             except Exception:
@@ -1091,6 +1232,12 @@ class App:
                     self._set_running(False)
                     last = self.feed.get("end-2l", "end-1c").strip()
                     self._notify(last or "Task finished.")
+                    if self.pending:
+                        self._run_scheduled(self.pending.pop(0), "run")
+                elif kind == "scheduled":
+                    self._run_scheduled(*data)
+                elif kind == "schedule_changed":
+                    self._reload_schedule()
                 elif kind == "hotkey":
                     if data == "stop":
                         self.stop()
@@ -1138,6 +1285,78 @@ def test_connection(cfg):
             return f"Connected, but '{cfg['lemonade_model']}' isn't installed. Available: {', '.join(models[:6])}"
         return f"Connected to Lemonade. {cfg['lemonade_model']} is available."
     return cli_bridge.test_cli(cfg)
+
+
+class ScheduleDialog(tk.Toplevel):
+    """Add or edit a scheduled task."""
+
+    def __init__(self, app, entry=None):
+        super().__init__(app.root)
+        self.app, self.entry = app, entry
+        self.title("Edit scheduled task" if entry else "Schedule a task")
+        self.resizable(False, False)
+        self.transient(app.root)
+        f = ttk.Frame(self, padding=16)
+        f.pack(fill="both")
+        f.columnconfigure(1, weight=1)
+        ttk.Label(f, text="What should WinPilot do?").grid(row=0, column=0, columnspan=2, sticky="w")
+        self.prompt = tk.Text(f, height=4, width=56, wrap="word", font=("Segoe UI", 10), relief="flat",
+                              bg=app.pal["bg"], fg=app.pal["fg"], insertbackground=app.pal["fg"], padx=6, pady=4,
+                              highlightthickness=1, highlightbackground=app.pal["view"])
+        self.prompt.grid(row=1, column=0, columnspan=2, sticky="we", pady=(4, 10))
+        self.prompt.insert("1.0", entry["prompt"] if entry else "Open Firefox and go to https://")
+        self.time = tk.StringVar(value=entry["time"] if entry else "")
+        ttk.Label(f, text="Time").grid(row=2, column=0, sticky="w", padx=(0, 12))
+        ttk.Entry(f, textvariable=self.time, width=12).grid(row=2, column=1, sticky="w")
+        ttk.Label(f, text="e.g. 23:00 or 11 pm", foreground=app.pal["muted"]).grid(row=3, column=1, sticky="w")
+        self.repeat = tk.StringVar(value=scheduler.REPEATS[entry["repeat"]] if entry else scheduler.REPEATS["once"])
+        ttk.Label(f, text="Repeat").grid(row=4, column=0, sticky="w", padx=(0, 12), pady=(8, 0))
+        box = ttk.Combobox(f, textvariable=self.repeat, state="readonly", width=24,
+                           values=list(scheduler.REPEATS.values()))
+        box.grid(row=4, column=1, sticky="w", pady=(8, 0))
+        box.bind("<<ComboboxSelected>>", lambda e: self._show_fields())
+        self.date = tk.StringVar(value=(entry or {}).get("date", ""))
+        self.date_row = ttk.Frame(f)
+        ttk.Label(self.date_row, text="Date").pack(side="left", padx=(0, 12))
+        ttk.Entry(self.date_row, textvariable=self.date, width=12).pack(side="left")
+        ttk.Label(self.date_row, text="YYYY-MM-DD, blank = next time that clock time comes",
+                  foreground=app.pal["muted"]).pack(side="left", padx=8)
+        self.day_vars = [tk.BooleanVar(value=i in (entry or {}).get("days", [])) for i in range(7)]
+        self.days_row = ttk.Frame(f)
+        for i, name in enumerate(scheduler.DAY_NAMES):
+            ttk.Checkbutton(self.days_row, text=name, variable=self.day_vars[i]).pack(side="left", padx=(0, 6))
+        self.date_row.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.days_row.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.error = ttk.Label(f, foreground=app.pal["error"], wraplength=440)
+        self.error.grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        btns = ttk.Frame(f)
+        btns.grid(row=8, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(btns, text="Save", style="Accent.TButton", command=self._save).pack(side="right", padx=8)
+        self._show_fields()
+        self.grab_set()
+
+    def _repeat_key(self):
+        return next(k for k, v in scheduler.REPEATS.items() if v == self.repeat.get())
+
+    def _show_fields(self):
+        repeat = self._repeat_key()
+        (self.date_row.grid if repeat == "once" else self.date_row.grid_remove)()
+        (self.days_row.grid if repeat == "weekly" else self.days_row.grid_remove)()
+
+    def _save(self):
+        args = (self.prompt.get("1.0", "end").strip(), self.time.get(), self._repeat_key(), self.date.get(),
+                [i for i, v in enumerate(self.day_vars) if v.get()])
+        try:
+            if self.entry:
+                self.app.schedule.update(self.entry["id"], *args)
+            else:
+                self.app.schedule.add(*args)
+        except ValueError as e:
+            self.error.configure(text=str(e))
+            return
+        self.app._reload_schedule()
+        self.destroy()
 
 
 class SettingsDialog(tk.Toplevel):

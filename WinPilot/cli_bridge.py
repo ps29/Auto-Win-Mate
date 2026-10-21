@@ -50,6 +50,23 @@ async def read_activity_log(last: int = 30, source: str = "all") -> str:
     source: 'all', 'you' (the user), 'agent' (you) or 'system' (window changes). Newest last."""
 
 
+async def schedule_task(prompt: str, time: str, repeat: str = "once", date: str = "", days: str = "") -> str:
+    """Schedule a task for WinPilot to do later, once or on a repeat. prompt: the complete instruction to
+    carry out then. time: local time like '23:00' or '11 pm'. repeat: once, daily, weekdays or weekly.
+    date (once): YYYY-MM-DD, blank for the next time that clock time comes. days (weekly): e.g. 'mon,wed'."""
+
+
+async def list_scheduled_tasks() -> str:
+    """List the scheduled tasks with their ids and next run times."""
+
+
+async def cancel_scheduled_task(task_id: str) -> str:
+    """Delete a scheduled task by the id from list_scheduled_tasks."""
+
+
+LOCAL_TOOLS = {f.__name__: f for f in (read_activity_log, schedule_task, list_scheduled_tasks, cancel_scheduled_task)}
+
+
 class Gateway:
     """WinPilot's tools as an MCP server on localhost. run_tool(name, args) -> (text, images, error)
     does the actual work (on a worker thread); images are (mime, base64) pairs."""
@@ -58,7 +75,7 @@ class Gateway:
         self.run_tool, self.token = run_tool, secrets.token_urlsafe(32)
         self.mcp = MCPServer(name=SERVER_NAME, instructions=server.mcp.instructions)
         for name in tool_names:
-            fn = read_activity_log if name == "read_activity_log" else getattr(server, name)
+            fn = LOCAL_TOOLS.get(name) or getattr(server, name)
             self.mcp.add_tool(self._wrap(name, fn), name=name, description=inspect.getdoc(fn))
         with socket.socket() as s:  # a free port
             s.bind(("127.0.0.1", 0))

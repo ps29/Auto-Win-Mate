@@ -80,7 +80,7 @@ class Screen:
 
     def screenshot(self):
         """(mime, base64) of the desktop at the model's size."""
-        img = self.grab().resize(self.size, Image.LANCZOS)
+        img = self.grab().resize(self.size, Image.BILINEAR, reducing_gap=2.0)
         return encode(img, "JPEG")
 
     def zoom(self, region):

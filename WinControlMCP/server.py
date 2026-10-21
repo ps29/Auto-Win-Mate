@@ -10,6 +10,7 @@ Safety:
   * Every action is logged to actions.log next to this file.
 """
 import asyncio
+import collections
 import concurrent.futures
 import ctypes
 import ctypes.wintypes as wt
@@ -241,9 +242,12 @@ def _root(hwnd):
     return UIAWrapper(UIAElementInfo(hwnd))
 
 
-def _walk(root, flt="", max_depth=12, max_items=250):
-    """Describable elements under root as (wrapper, depth, line); plus whether max_items cut it short."""
+def _walk(root, flt="", max_depth=12, max_items=250, seen=None):
+    """Describable elements under root as (wrapper, depth, line); plus whether max_items cut it short.
+    `seen`, if given, gets "n": how many describable elements were visited, filter or not."""
     found, flt = [], flt.lower()
+    seen = seen if seen is not None else {}
+    seen["n"] = 0
 
     def walk(el, depth):
         if depth > max_depth or len(found) >= max_items:
@@ -256,6 +260,8 @@ def _walk(root, flt="", max_depth=12, max_items=250):
             if len(found) >= max_items:
                 return
             line = _describe(child)
+            if line:
+                seen["n"] += 1
             if line and (not flt or flt in line.lower()):
                 found.append((child, depth, line))
             walk(child, depth + 1)
@@ -266,9 +272,9 @@ def _walk(root, flt="", max_depth=12, max_items=250):
 
 def _web_document(hwnd):
     """The page content of a Chrome/Edge/Electron window (its first Document element), or None."""
-    queue = [(_root(hwnd), 0)]
+    queue = collections.deque([(_root(hwnd), 0)])
     while queue:
-        el, depth = queue.pop(0)
+        el, depth = queue.popleft()
         if el.element_info.control_type == "Document" and depth:
             return el
         if depth < 8:
@@ -297,8 +303,9 @@ def get_ui_elements(window: str | int, filter: str = "", max_depth: int = 12, ma
             raise ValueError("No web page found in that window. web_only works with Chrome, Edge and "
                              "Electron apps; call get_ui_elements without it.")
         max_depth = max(max_depth, 30)  # web pages nest deeply
-    found, truncated = _walk(root, filter, max_depth, max_items)
-    if len(found) < 10:
+    seen = {}
+    found, truncated = _walk(root, filter, max_depth, max_items, seen)
+    if seen["n"] < 10:  # count before filtering, so a filter doesn't trigger the wait on a built tree
         # Chromium and Electron apps build their accessibility tree only once someone asks.
         time.sleep(0.6)
         found, truncated = _walk(root, filter, max_depth, max_items)
@@ -640,7 +647,7 @@ def _capture(window):
 def _shrink(img, max_width):
     scale = max(1.0, img.width / max(320, max_width))
     if scale > 1:
-        img = img.resize((round(img.width / scale), round(img.height / scale)), PILImage.LANCZOS)
+        img = img.resize((round(img.width / scale), round(img.height / scale)), PILImage.BILINEAR, reducing_gap=2.0)
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=85)
     return img, scale, Image(data=buf.getvalue(), format="jpeg")
